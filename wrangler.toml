@@ -1,0 +1,35 @@
+name = "file-zipper"
+main = "src/index.ts"
+compatibility_date = "2025-08-15"
+
+[[r2_buckets]]
+binding = "SOURCE_BUCKET"
+bucket_name = "moretransfer-storage"
+
+[[r2_buckets]]
+binding = "OUTPUT_BUCKET"
+bucket_name = "moretransfer-storage"
+
+[[queues.consumers]]
+queue = "zip-bundles"
+max_batch_size = 1
+max_retries = 5
+dead_letter_queue = "zip-bundles-dlq"
+
+[[queues.producers]]
+binding = "ZIP_QUEUE"
+queue = "zip-bundles"
+
+[[durable_objects.bindings]]
+name = "ZipLocks"
+class_name = "ZipLocksDO"
+
+[vars]
+ZIP_OUTPUT_PREFIX = "prebaked-zips/"
+MAX_FILES = "5000"
+MAX_ZIP_BYTES = "524288000"
+
+# Durable Object migration (required on first deploy)
+[[migrations]]
+tag = "v1"
+new_classes = ["ZipLocksDO"]

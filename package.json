@@ -1,0 +1,22 @@
+{
+  "name": "file-zipper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "wrangler:login": "wrangler login",
+    "wrangler:deploy": "wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20250820.0",
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "wrangler": "^4.31.0"
+  }
+}
