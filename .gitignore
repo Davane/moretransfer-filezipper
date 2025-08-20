@@ -1,4 +1,6 @@
 .DS_Store
 
-node_modules/
+.wrangler/
 .vscode/
+node_modules/
+.downloads/

@@ -1,35 +1,90 @@
 name = "file-zipper"
 main = "src/index.ts"
 compatibility_date = "2025-08-15"
+workers_dev = true
 
-[[r2_buckets]]
+# -----------------------------
+# DEV ENVIRONMENT
+# -----------------------------
+[env.dev]
+name = "file-zipper-dev"
+
+# R2
+[[env.dev.r2_buckets]]
 binding = "SOURCE_BUCKET"
-bucket_name = "moretransfer-storage"
+bucket_name = "moretransfer-dev"
 
-[[r2_buckets]]
+[[env.dev.r2_buckets]]
 binding = "OUTPUT_BUCKET"
-bucket_name = "moretransfer-storage"
+bucket_name = "moretransfer-dev"
 
-[[queues.consumers]]
-queue = "zip-bundles"
+# Queues
+[[env.dev.queues.consumers]]
+queue = "moretransfer-file-zipper-dev"
 max_batch_size = 1
-max_retries = 5
-dead_letter_queue = "zip-bundles-dlq"
+max_retries = 3
+dead_letter_queue = "moretransfer-file-zipper-dev-dlq"
 
-[[queues.producers]]
-binding = "ZIP_QUEUE"
-queue = "zip-bundles"
+[[env.dev.queues.producers]]
+binding = "QUEUE_FILE_ZIPPER"
+queue = "moretransfer-file-zipper-dev"
 
-[[durable_objects.bindings]]
+# Durable Objects
+[[env.dev.durable_objects.bindings]]
 name = "ZipLocks"
 class_name = "ZipLocksDO"
 
-[vars]
-ZIP_OUTPUT_PREFIX = "prebaked-zips/"
+# Vars
+[env.dev.vars]
+ZIP_OUTPUT_PREFIX = "bundle"
+ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"
 MAX_ZIP_BYTES = "524288000"
 
-# Durable Object migration (required on first deploy)
-[[migrations]]
+# DO migrations (per env)
+[[env.dev.migrations]]
+tag = "v1"
+new_classes = ["ZipLocksDO"]
+
+# -----------------------------
+# PROD ENVIRONMENT
+# -----------------------------
+[env.prod]
+name = "moretransfer-file-zipper-prod"
+
+# R2
+[[env.prod.r2_buckets]]
+binding = "SOURCE_BUCKET"
+bucket_name = "moretransfer-storage"
+
+[[env.prod.r2_buckets]]
+binding = "OUTPUT_BUCKET"
+bucket_name = "moretransfer-storage"
+
+# Queues
+[[env.prod.queues.consumers]]
+queue = "moretransfer-file-zipper"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "moretransfer-file-zipper-dlq"
+
+[[env.prod.queues.producers]]
+binding = "QUEUE_FILE_ZIPPER"
+queue = "moretransfer-file-zipper"
+
+# Durable Objects
+[[env.prod.durable_objects.bindings]]
+name = "ZipLocks"
+class_name = "ZipLocksDO"
+
+# Vars
+[env.prod.vars]
+ZIP_OUTPUT_PREFIX = "bundle"
+ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
+MAX_FILES = "5000"
+MAX_ZIP_BYTES = "524288000"
+
+# DO migrations (per env)
+[[env.prod.migrations]]
 tag = "v1"
 new_classes = ["ZipLocksDO"]

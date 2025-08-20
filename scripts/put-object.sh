@@ -1,0 +1,8 @@
+# Put them in your local SOURCE bucket under a shared prefix
+$BUCKET=$1
+$UPLOAD_KEY=$2
+$FILE_PATH=$3
+
+# example: 
+# - wrangler r2 object put moretransfer-dev/2025-08-20/tr_123/test-file-1.txt --file=./resources/test-file-1.txt
+wrangler r2 object put ${BUCKET}/$UPLOAD_KEY --file=$FILE_PATH --env dev
