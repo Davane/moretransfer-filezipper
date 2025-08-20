@@ -36,6 +36,7 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.dev.vars]
+HMAC_SECRET = "base64-or-hex-secret"
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"
@@ -79,10 +80,11 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.prod.vars]
+# HMAC_SECRET = "base64-or-hex-secret"
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"
-MAX_ZIP_BYTES = "524288000"
+MAX_ZIP_BYTES = "3145728000" # 3GB
 
 # DO migrations (per env)
 [[env.prod.migrations]]

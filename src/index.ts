@@ -1,5 +1,6 @@
 import { Zip, ZipDeflate } from "fflate";
 import { ZipJob } from "./lib/types/types";
+import { verifyHmac } from "./lib/utils";
 
 export interface Env {
   SOURCE_BUCKET: R2Bucket;
@@ -16,6 +17,9 @@ export interface Env {
 
   // Durable Object
   ZipLocks: DurableObjectNamespace;
+
+  // Environment variables
+  HMAC_SECRET: string
 }
 
 export default {
@@ -26,6 +30,15 @@ export default {
    */
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method === "POST" && new URL(req.url).pathname === "/compress-files") {
+
+      try {
+        // TODO: remove when testing from CLI
+        await verifyHmac(req, env.HMAC_SECRET);
+      } catch (error) {
+        console.error("HMAC verification failed:", error);
+        return new Response("Unauthorized", { status: 401 });
+      }
+      
       const body = await req.json<Partial<ZipJob>>();
 
       console.log("Compressing files:", JSON.stringify(body));
@@ -132,7 +145,7 @@ async function processZipJob(job: ZipJob, env: Env) {
   const zipOutputKey =
     job.zipOutputKey ?? `${env.ZIP_OUTPUT_PREFIX}/${currentObjectPrefix.replace(/\/?$/, "")}/${env.ZIP_OUTPUT_FILE_NAME}.zip`;
   const maxFiles = toInt(env.MAX_FILES, 100);
-  const maxZipBytes = toInt(env.MAX_ZIP_BYTES, 1000 * 1024 * 1024); // 1GB
+  const maxZipBytes = toInt(env.MAX_ZIP_BYTES, 3000 * 1024 * 1024); // 3GB
 
   // Per-prefix lock so two workers don’t create the same ZIP simultaneously
   const id = env.ZipLocks.idFromName(currentObjectPrefix);
@@ -185,7 +198,7 @@ async function processZipJob(job: ZipJob, env: Env) {
         totalBytes += obj.size;
 
         if (totalBytes > maxZipBytes) {
-          console.error(`ZIP size limit hit: ${maxZipBytes} bytes`);
+          console.error(`ZIP size limit hit: ${maxZipBytes} bytes. Current limit is ${totalBytes}`);
           throw new Error(`ZIP size limit hit: ${maxZipBytes} bytes`);
         }
 

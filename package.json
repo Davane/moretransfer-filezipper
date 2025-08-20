@@ -11,7 +11,9 @@
     "r2:get": "sh ./scripts/get-objects.sh",
     "enqueue": "sh ./scripts/test-enqueue.sh",
     "unzip": "unzip -l /tmp/tr_demo.zip",
-    "deploy": "wrangler deploy --env prod"
+    "deploy": "wrangler deploy --env prod",
+    "queue:create": "wrangler queues create <queue-name>",
+    "secret:create": "wrangler secret put <SECRET_NAME> --env prod"
   },
   "keywords": [],
   "author": "",
