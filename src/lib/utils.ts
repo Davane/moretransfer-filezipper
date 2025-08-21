@@ -1,29 +1,39 @@
-export async function verifyHmac(req: Request, secret: string) {
-  const sig = req.headers.get("x-signature");
-  const ts = req.headers.get("x-timestamp");
-  if (!sig || !ts) throw new Response("Unauthorized", { status: 401 });
+export function slugify(text: string) {
+  return text
+    .toString()
+    .normalize("NFD") // split accented letters into base + accent
+    .replace(/[\u0300-\u036f]/g, "") // remove accents
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-") // replace non-alphanumeric with dashes
+    .replace(/^-+|-+$/g, ""); // remove leading/trailing dashes
+}
 
-  // Skew check
-  const now = Date.now();
-  const t = Number.isFinite(+ts) ? +ts : Date.parse(ts);
-  if (!Number.isFinite(t) || Math.abs(now - t) > 5 * 60 * 1000) {
-    throw new Response("Unauthorized (timestamp)", { status: 401 });
+export function createSafeUploadKey(transferId: string, filename: string, rootPrefix = "uploads") {
+  const ext = filename.includes(".") ? filename.split(".").pop() : "";
+  const date = new Date().toISOString().slice(0, 10);
+
+  return `${rootPrefix}/${date}/${transferId}/${crypto.randomUUID()}${ext ? "." + ext : ""}`;
+}
+
+export async function fetchWithCredentials<T>(endpoint: string, options: RequestInit = {}) {
+  const res = await fetch(endpoint, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+    ...options,
+  });
+
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`Failed to fetch: ${res.status} ${error}`);
   }
 
-  const body = await req.clone().text();
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"]
-  );
-  const data = enc.encode(`${t}\n${body}`);
-  const raw = await crypto.subtle.sign("HMAC", key, data);
-  const digest = [...new Uint8Array(raw)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return res.json() as T;
+}
 
-  if (digest !== sig) {
-    throw new Response("Unauthorized (signature)", { status: 401 });
-  }
+export function calculateExponentialBackoff(attempts: number, baseDelaySeconds: number) {
+  return baseDelaySeconds ** attempts;
 }

@@ -36,10 +36,13 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.dev.vars]
+ENVIRONMENT = "development"
+WEB_API_BASE_URL = "https://localhost:3000"
 SECRET_KEY = "21bc7c5958d0008957b8c62da5a6c0c9fc56f73002ce6000fc49966e02fe4bb9"
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"
+BASE_RETRY_DELAY_SECONDS = 30
 MAX_ZIP_BYTES = "524288000"
 
 # DO migrations (per env)
@@ -84,7 +87,10 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.prod.vars]
+ENVIRONMENT = "production"
 # SECRET_KEY = "base64-or-hex-secret"
+WEB_API_BASE_URL = "https://moretransfer.com"
+BASE_RETRY_DELAY_SECONDS = 30
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"

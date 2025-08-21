@@ -1,16 +1,12 @@
 import { Zip, ZipDeflate } from "fflate";
-import { RequestPath, ZipJob } from "./lib/types/types";
-import { verifyHmac } from "./lib/utils";
+import { RequestPath, TransferStatus, TransferUpdateRequest, ZipJob } from "./lib/types/types";
+import { verifyHmac } from "./lib/crypto";
+import { WebAPIService } from "./lib/web-api-service";
+import { calculateExponentialBackoff } from "./lib/utils";
 
 export interface Env {
   SOURCE_BUCKET: R2Bucket;
   OUTPUT_BUCKET: R2Bucket;
-  
-  ZIP_OUTPUT_PREFIX: string;
-  ZIP_OUTPUT_FILE_NAME: string;
-
-  MAX_FILES?: string;
-  MAX_ZIP_BYTES?: string;
 
   // Queues
   QUEUE_FILE_ZIPPER: Queue;
@@ -19,53 +15,69 @@ export interface Env {
   ZipLocks: DurableObjectNamespace;
 
   // Environment variables
-  SECRET_KEY: string
+  ENVIRONMENT: "development" | "production";
+  SECRET_KEY: string;
+  WEB_API_BASE_URL: string;
+  ZIP_OUTPUT_PREFIX: string;
+  ZIP_OUTPUT_FILE_NAME: string;
+  MAX_FILES?: string;
+  MAX_ZIP_BYTES?: string;
+  BASE_RETRY_DELAY_SECONDS: number;
 }
 
 export default {
   /**
-   * Simple HTTP producer to enqueue jobs (optional – you can also enqueue from other workers)
+   * Simple HTTP producer(endpoint) to enqueue jobs
    * @param req - The incoming request
    * @param env - The environment variables
    */
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (req.method === "POST" && new URL(req.url).pathname === RequestPath.COMPRESS_FILES) {
+    if (req.method !== "POST") {
+      return new Response(undefined, { status: 405 });
+    }
 
+    const url = new URL(req.url);
+    console.log(`Executing worker in ${env.ENVIRONMENT} for url ${url.pathname}`);
+
+    if (url.pathname !== RequestPath.COMPRESS_FILES) {
+      return new Response(undefined, { status: 404 });
+    }
+
+    if (env.ENVIRONMENT === "production") {
+      console.log(`Verifying request signature in ${env.ENVIRONMENT}...`);
       try {
-        // TODO: remove when testing from CLI
         await verifyHmac(req, env.SECRET_KEY);
       } catch (error) {
         console.error("HMAC verification failed:", error);
         return new Response("Unauthorized", { status: 401 });
       }
-      
-      const body = await req.json<Partial<ZipJob>>();
-
-      console.log("Compressing files:", JSON.stringify(body));
-      if (!body.objectPrefix) {
-        return new Response("Missing prefix", { status: 400 });
-      }
-
-      const job: ZipJob = {
-        objectPrefix: body.objectPrefix,
-        zipOutputKey: body.zipOutputKey,
-        includeEmpty: body.includeEmpty ?? true,
-        createdBy: body.createdBy ?? "api",
-      };
-
-      try {
-        console.log("Sending job to queue:", JSON.stringify(job));
-        await env.QUEUE_FILE_ZIPPER.send(job);
-        console.log("Job queued", JSON.stringify(job));
-      } catch (error) {
-        console.error("Failed to enqueue job:", error);
-        return new Response("Failed to enqueue job", { status: 500 });
-      }
-
-      return new Response("Enqueued", { status: 202 });
     }
 
-    return new Response("OK");
+    const body = await req.json<ZipJob>();
+    console.log("Compressing files:", JSON.stringify(body));
+
+    if (!body.objectPrefix) {
+      return new Response("Missing prefix", { status: 400 });
+    }
+
+    const job: ZipJob = {
+      transferId: body.transferId,
+      objectPrefix: body.objectPrefix,
+      zipOutputKey: body.zipOutputKey,
+      includeEmpty: body.includeEmpty ?? true,
+      createdBy: body.createdBy ?? "api",
+    };
+
+    try {
+      console.log("Sending job to queue:", JSON.stringify(job));
+      await env.QUEUE_FILE_ZIPPER.send(job);
+      console.log("Job queued", JSON.stringify(job));
+    } catch (error) {
+      console.error("Failed to enqueue job:", error);
+      return new Response("Failed to enqueue job", { status: 500 });
+    }
+
+    return new Response("Enqueued", { status: 202 });
   },
 
   /**
@@ -76,17 +88,48 @@ export default {
    * @param ctx - The execution context
    */
   async queue(batch: MessageBatch<ZipJob>, env: Env, ctx: ExecutionContext) {
+    const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
+
     for (const msg of batch.messages) {
       console.log(`Processing message ${msg.id} from batch`, JSON.stringify(msg.body));
+      const messagePayload = msg.body;
+
+      let transferStatusPayload: TransferUpdateRequest = {
+        status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+      };
 
       try {
-        await processZipJob(msg.body, env);
+        // Update the transfer status
+        transferStatusPayload = {
+          status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+          bundleObjectKey: await processZipJob(messagePayload, env),
+        };
+
         // Acknowledge the message has been processed
         msg.ack();
       } catch (err) {
-        // Let the queue retry with exponential backoff
-        console.error("Zip job failed:", err);
-        msg.retry();
+        const delaySeconds = calculateExponentialBackoff(
+          msg.attempts,
+          env.BASE_RETRY_DELAY_SECONDS
+        );
+        console.error(
+          `Compression job failed. Attempt: ${msg.attempts}. Retry in ${delaySeconds} seconds:`,
+          err
+        );
+
+        msg.retry({ delaySeconds });
+      } finally {
+        try {
+          // Update the transfer status.
+          await webAPIService.updateTransferStatus(
+            messagePayload.transferId,
+            transferStatusPayload
+          );
+        } catch (error) {
+          // If failed we dont want to redo the bundling process.
+          // Ignore errors here and handle when user attempts to download
+          console.warn(`Failed to update transfer status ${messagePayload.transferId}:`, error);
+        }
       }
     }
   },
@@ -143,7 +186,10 @@ export class ZipLocksDO {
 async function processZipJob(job: ZipJob, env: Env) {
   const currentObjectPrefix = cleanPrefix(job.objectPrefix);
   const zipOutputKey =
-    job.zipOutputKey ?? `${env.ZIP_OUTPUT_PREFIX}/${currentObjectPrefix.replace(/\/?$/, "")}/${env.ZIP_OUTPUT_FILE_NAME}.zip`;
+    job.zipOutputKey ??
+    `${env.ZIP_OUTPUT_PREFIX}/${currentObjectPrefix.replace(/\/?$/, "")}/${
+      env.ZIP_OUTPUT_FILE_NAME
+    }.zip`;
   const maxFiles = toInt(env.MAX_FILES, 100);
   const maxZipBytes = toInt(env.MAX_ZIP_BYTES, 3000 * 1024 * 1024); // 3GB
 
@@ -246,6 +292,7 @@ async function processZipJob(job: ZipJob, env: Env) {
     // Wait for multipart upload to finish
     const output = await uploader;
     console.log("ZIP completed:", output.key, "ETag:", output.etag);
+    return output.key;
   } finally {
     await stub.fetch("https://lock/unlock", { method: "POST" });
   }
@@ -305,7 +352,7 @@ function createZipStream() {
  */
 async function pumpToMultipart(
   bucket: R2Bucket,
-  mp: R2MultipartUpload,
+  multipartUpload: R2MultipartUpload,
   stream: ReadableStream<Uint8Array>
 ) {
   const reader = stream.getReader();
@@ -335,7 +382,7 @@ async function pumpToMultipart(
       }
     }
 
-    const uploaded = await mp.uploadPart(partNumber++, combined);
+    const uploaded = await multipartUpload.uploadPart(partNumber++, combined);
     etags.push(uploaded);
     current = [];
     currentBytes = 0;
@@ -357,7 +404,7 @@ async function pumpToMultipart(
     }
   }
 
-  return mp.complete(etags);
+  return multipartUpload.complete(etags);
 }
 
 function cleanPrefix(p: string) {
