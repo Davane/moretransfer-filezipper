@@ -1,3 +1,7 @@
+export enum RequestPath {
+  COMPRESS_FILES = "/compress-files"
+}
+
 // Payload the producer will enqueue
 export interface ZipJob {
   objectPrefix: string; // R2 prefix to collect

@@ -36,7 +36,7 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.dev.vars]
-HMAC_SECRET = "base64-or-hex-secret"
+SECRET_KEY = "21bc7c5958d0008957b8c62da5a6c0c9fc56f73002ce6000fc49966e02fe4bb9"
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"
@@ -52,6 +52,10 @@ new_classes = ["ZipLocksDO"]
 # -----------------------------
 [env.prod]
 name = "moretransfer-file-zipper-prod"
+
+# [[env.prod.routes]]
+# pattern = "shop.example.com"
+# custom_domain = true
 
 # R2
 [[env.prod.r2_buckets]]
@@ -80,7 +84,7 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.prod.vars]
-# HMAC_SECRET = "base64-or-hex-secret"
+# SECRET_KEY = "base64-or-hex-secret"
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "5000"

@@ -1,5 +1,5 @@
 import { Zip, ZipDeflate } from "fflate";
-import { ZipJob } from "./lib/types/types";
+import { RequestPath, ZipJob } from "./lib/types/types";
 import { verifyHmac } from "./lib/utils";
 
 export interface Env {
@@ -19,7 +19,7 @@ export interface Env {
   ZipLocks: DurableObjectNamespace;
 
   // Environment variables
-  HMAC_SECRET: string
+  SECRET_KEY: string
 }
 
 export default {
@@ -29,11 +29,11 @@ export default {
    * @param env - The environment variables
    */
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (req.method === "POST" && new URL(req.url).pathname === "/compress-files") {
+    if (req.method === "POST" && new URL(req.url).pathname === RequestPath.COMPRESS_FILES) {
 
       try {
         // TODO: remove when testing from CLI
-        await verifyHmac(req, env.HMAC_SECRET);
+        await verifyHmac(req, env.SECRET_KEY);
       } catch (error) {
         console.error("HMAC verification failed:", error);
         return new Response("Unauthorized", { status: 401 });
