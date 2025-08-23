@@ -99,10 +99,12 @@ export default {
       };
 
       try {
+        const bundleObjectKey = await processZipJob(messagePayload, env);
+        
         // Update the transfer status
         transferStatusPayload = {
-          status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
-          bundleObjectKey: await processZipJob(messagePayload, env),
+          status: TransferStatus.READY,
+          bundleObjectKey,
         };
 
         // Acknowledge the message has been processed

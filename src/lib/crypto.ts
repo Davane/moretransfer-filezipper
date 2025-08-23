@@ -2,15 +2,14 @@
  * This file created and verifies HMAC signatures on edge runtime
  */
 
-
-async function importKey(secret: string) {
-  const enc = new TextEncoder();
+async function importKey(secret: string, keyUsage: string[], encoder?: TextEncoder) {
+  const enc = encoder || new TextEncoder();
   return await crypto.subtle.importKey(
     "raw",
     enc.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign", "verify"]
+    keyUsage // ["sign", "verify"]
   );
 }
 
@@ -28,15 +27,15 @@ export async function verifyHmac(req: Request, secret: string) {
     throw new Response("Unauthorized (timing)", { status: 401 });
   }
 
-  const enc  = new TextEncoder();
+  const enc = new TextEncoder();
   const body = await req.clone().text();
-  const key  = await importKey(secret);
-
+  const key = await importKey(secret, ["verify"], enc);
   const data = enc.encode(`${t}\n${body}`);
   const raw = await crypto.subtle.sign("HMAC", key, data);
-  
+
   const digest = [...new Uint8Array(raw)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
+  // TODO: consider using a constant-time comparison (crypto.subtle.timingSafeEqual)
   if (digest !== sig) {
     throw new Response("Unauthorized (signature)", { status: 401 });
   }
@@ -46,9 +45,10 @@ export async function createHmacSha256Hex(payload: string, secret: string) {
   // Create HMAC SHA256 hash on edge runtime
   const enc = new TextEncoder();
   const data = enc.encode(payload);
+  const keyUsage = ["sign"];
 
-  const key = await importKey(secret);
-  const raw = await crypto.subtle.sign("HMAC", key, data);
+  const key = await importKey(secret, keyUsage, enc);
+  const sig = await crypto.subtle.sign("HMAC", key, data);
 
-  return [...new Uint8Array(raw)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

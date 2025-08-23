@@ -27,21 +27,21 @@ class WebAPIService {
     }
 
     const ts = Date.now().toString();
-    const json = JSON.stringify(body);
-    const sig = await createHmacSha256Hex(`${ts}\n${json}`, this._secret);
+    const rawJson = JSON.stringify(body);
+    const message = `${ts}\n${rawJson}`;
 
-    const headers: Record<string, string> = {
+    const sig = await createHmacSha256Hex(message, this._secret);
+
+    return {
       "x-timestamp": ts,
       "x-signature": sig,
     };
-
-    return headers;
   }
 
   async updateTransferStatus(transferId: string, request: TransferUpdateRequest) {
     const headers = await this.getHeaderSignature(request);
     const url = `${this._baseUrl}/api/transfers/${transferId}/compression-status`;
-    console.log(`Updating transfer status for ${transferId}:`, url, JSON.stringify(request), );
+    console.log(`Updating transfer status for ${transferId}:`, url, JSON.stringify(request));
 
     try {
       const uploadMeta = await fetchWithCredentials<any>(url, {
