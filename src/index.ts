@@ -15,7 +15,6 @@ export interface Env {
   ZipLocks: DurableObjectNamespace;
 
   // Environment variables
-  ENVIRONMENT: "development" | "production";
   SECRET_KEY: string;
   WEB_API_BASE_URL: string;
   ZIP_OUTPUT_PREFIX: string;
@@ -37,20 +36,17 @@ export default {
     }
 
     const url = new URL(req.url);
-    console.log(`Executing worker in ${env.ENVIRONMENT} for url ${url.pathname}`);
+    console.log(`Executing worker for url ${url.pathname}`);
 
     if (url.pathname !== RequestPath.COMPRESS_FILES) {
       return new Response(undefined, { status: 404 });
     }
 
-    if (env.ENVIRONMENT === "production") {
-      console.log(`Verifying request signature in ${env.ENVIRONMENT}...`);
-      try {
-        await verifyHmac(req, env.SECRET_KEY);
-      } catch (error) {
-        console.error("HMAC verification failed:", error);
-        return new Response("Unauthorized", { status: 401 });
-      }
+    try {
+      await verifyHmac(req, env.SECRET_KEY);
+    } catch (error) {
+      console.error("HMAC verification failed:", error);
+      return new Response("Unauthorized", { status: 401 });
     }
 
     const body = await req.json<ZipJob>();
@@ -100,7 +96,7 @@ export default {
 
       try {
         const bundleObjectKey = await processZipJob(messagePayload, env);
-        
+
         // Update the transfer status
         transferStatusPayload = {
           status: TransferStatus.READY,

@@ -36,7 +36,7 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.dev.vars]
-ENVIRONMENT = "development"
+# ENVIRONMENT = "development"
 WEB_API_BASE_URL = "http://localhost:3000"
 SECRET_KEY = "-"
 ZIP_OUTPUT_PREFIX = "bundle"
@@ -87,7 +87,7 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.prod.vars]
-ENVIRONMENT = "production"
+# ENVIRONMENT = "production"
 # SECRET_KEY = "base64-or-hex-secret"
 WEB_API_BASE_URL = "https://moretransfer.com"
 BASE_RETRY_DELAY_SECONDS = 30
