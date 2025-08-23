@@ -219,14 +219,20 @@ async function processZipJob(job: ZipJob, env: Env) {
     const uploader = pumpToMultipart(env.OUTPUT_BUCKET, mp, stream);
 
     // Walk all objects with the prefix and add them to the ZIP
+    let totalFiles = 0;
+    let totalBytes = 0;
     let listed: R2Objects = await env.SOURCE_BUCKET.list({
       prefix: currentObjectPrefix,
       limit: 500,
     });
-    let totalFiles = 0;
-    let totalBytes = 0;
+    
 
     console.log(`Listing ${listed.objects.length} objects for prefix: ${currentObjectPrefix}`);
+    if (listed.objects.length === 0) {
+      console.log(`No objects found for prefix: ${currentObjectPrefix}`);
+      throw new Error(`No objects found for prefix: ${currentObjectPrefix}`);
+    }
+
     while (true) {
       for (const obj of listed.objects) {
         if (totalFiles >= maxFiles) {

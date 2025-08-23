@@ -85,6 +85,11 @@ queue = "moretransfer-file-zipper"
 name = "ZipLocks"
 class_name = "ZipLocksDO"
 
+# Logging and Observability
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Vars
 [env.prod.vars]
 # ENVIRONMENT = "production"
