@@ -262,9 +262,10 @@ async function processZipJob(job: ZipJob, env: Env) {
 
         const key = obj.key;
         const nameInZip =
-          key.substring(currentObjectPrefix.length).replace(/^\/+/, "") ||
-          obj.key.split("/").pop() ||
-          "file";
+          key.slice(key.indexOf("__") + 2, key.length) || // Get the uploaded filename
+          key.substring(currentObjectPrefix.length).replace(/^\/+/, "") || // or use the last part of the key
+          obj.key.split("/").pop() || // or use the last part of the key
+          "file"; // else just use file
 
         const r = await env.SOURCE_BUCKET.get(key);
         if (!r?.body) {
@@ -382,7 +383,9 @@ async function pumpToMultipart(
   async function flushFullBuffer() {
     // Upload an EXACTLY PART_SIZE slice
     const toSend = offset === PART_SIZE ? buf : buf.subarray(0, offset);
-    if (toSend.byteLength === 0) return; // nothing to send
+    if (toSend.byteLength === 0) {
+      return;
+    } // nothing to send
 
     const uploaded = await multipartUpload.uploadPart(partNumber++, toSend);
     etags.push(uploaded);
