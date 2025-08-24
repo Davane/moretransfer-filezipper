@@ -6,6 +6,7 @@
   "scripts": {
     "login": "login",
     "dev": "wrangler dev --env dev",
+    "dev:no-auth": "wrangler dev --env dev --var \"SKIP_REQUEST_VERIFICATION:true\"",
     "r2:put": "sh ./scripts/put-object.sh",
     "r2:list": "sh ./scripts/list-objects.sh",
     "r2:get": "sh ./scripts/get-objects.sh",
