@@ -368,52 +368,57 @@ async function pumpToMultipart(
   stream: ReadableStream<Uint8Array>
 ) {
   const reader = stream.getReader();
-  const PART_SIZE = 16 * 1024 * 1024; // 16MB parts
+
+  // R2 rules: non-final parts must be equal size, >= 5 MiB
+  const PART_SIZE = 16 * 1024 * 1024; // 16 MiB (>= 5 MiB)
+
   const etags: R2UploadedPart[] = [];
   let partNumber = 1;
 
-  // Assemble parts
-  let current: Uint8Array[] = [];
-  let currentBytes = 0;
+  // Fixed-size buffer for the current part
+  let buf = new Uint8Array(PART_SIZE);
+  let offset = 0;
 
-  async function flushPart(final = false) {
-    if (currentBytes === 0 && !final) {
-      return;
-    }
+  async function flushFullBuffer() {
+    // Upload an EXACTLY PART_SIZE slice
+    const toSend = offset === PART_SIZE ? buf : buf.subarray(0, offset);
+    if (toSend.byteLength === 0) return; // nothing to send
 
-    // Coalesce chunks to a single Uint8Array for the part
-    let combined: Uint8Array;
-    if (current.length === 1) {
-      combined = current[0];
-    } else {
-      combined = new Uint8Array(currentBytes);
-      let offset = 0;
-      for (const c of current) {
-        combined.set(c, offset);
-        offset += c.byteLength;
-      }
-    }
-
-    const uploaded = await multipartUpload.uploadPart(partNumber++, combined);
+    const uploaded = await multipartUpload.uploadPart(partNumber++, toSend);
     etags.push(uploaded);
-    current = [];
-    currentBytes = 0;
+
+    // New buffer for the next part (avoid sharing mutating memory)
+    buf = new Uint8Array(PART_SIZE);
+    offset = 0;
   }
 
   while (true) {
     const { value, done } = await reader.read();
     if (done) {
-      await flushPart(true);
       break;
     }
+    if (!value || value.byteLength === 0) {
+      continue;
+    }
 
-    if (value?.byteLength) {
-      current.push(value);
-      currentBytes += value.byteLength;
-      if (currentBytes >= PART_SIZE) {
-        await flushPart();
+    let chunk = value;
+    let i = 0;
+    while (i < chunk.byteLength) {
+      const take = Math.min(PART_SIZE - offset, chunk.byteLength - i);
+      buf.set(chunk.subarray(i, i + take), offset);
+      offset += take;
+      i += take;
+
+      // Only flush when we filled EXACTLY PART_SIZE bytes
+      if (offset === PART_SIZE) {
+        await flushFullBuffer();
       }
     }
+  }
+
+  // Final (possibly smaller) part
+  if (offset > 0) {
+    await flushFullBuffer(); // sends buf.subarray(0, offset)
   }
 
   return multipartUpload.complete(etags);
