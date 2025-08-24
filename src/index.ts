@@ -261,8 +261,11 @@ async function processZipJob(job: ZipJob, env: Env) {
         }
 
         const key = obj.key;
+        const delimiterIndex = key.indexOf("__");
+        const uploadedFileName =
+          delimiterIndex >= 0 ? key.slice(delimiterIndex + 2, key.length) : "";
         const nameInZip =
-          key.slice(key.indexOf("__") + 2, key.length) || // Get the uploaded filename
+          uploadedFileName || // Get the uploaded filename
           key.substring(currentObjectPrefix.length).replace(/^\/+/, "") || // or use the last part of the key
           obj.key.split("/").pop() || // or use the last part of the key
           "file"; // else just use file
