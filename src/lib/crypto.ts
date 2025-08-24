@@ -15,6 +15,8 @@ async function importKey(secret: string, keyUsage: string[], encoder?: TextEncod
 }
 
 export async function verifyHmac(req: Request, secret: string) {
+  console.log("Verifying Request signature...");
+
   const sig = req.headers.get("x-signature");
   const ts = req.headers.get("x-timestamp");
   if (!sig || !ts) {

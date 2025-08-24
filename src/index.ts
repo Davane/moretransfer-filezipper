@@ -22,6 +22,7 @@ export interface Env {
   MAX_FILES?: string;
   MAX_ZIP_BYTES?: string;
   BASE_RETRY_DELAY_SECONDS: number;
+  SKIP_REQUEST_VERIFICATION: boolean | undefined;
 }
 
 export default {
@@ -42,11 +43,15 @@ export default {
       return new Response(undefined, { status: 404 });
     }
 
-    try {
-      await verifyHmac(req, env.SECRET_KEY);
-    } catch (error) {
-      console.error("HMAC verification failed:", error);
-      return new Response("Unauthorized", { status: 401 });
+    if (!env.SKIP_REQUEST_VERIFICATION) {
+      try {
+        await verifyHmac(req, env.SECRET_KEY);
+      } catch (error) {
+        console.error("HMAC verification failed:", error);
+        return new Response("Unauthorized", { status: 401 });
+      }
+    } else {
+      console.warn("Skipping request verification");
     }
 
     const body = await req.json<ZipJob>();
@@ -225,7 +230,6 @@ async function processZipJob(job: ZipJob, env: Env) {
       prefix: currentObjectPrefix,
       limit: 500,
     });
-    
 
     console.log(`Listing ${listed.objects.length} objects for prefix: ${currentObjectPrefix}`);
     if (listed.objects.length === 0) {

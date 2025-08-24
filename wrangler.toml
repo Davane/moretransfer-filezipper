@@ -89,9 +89,12 @@ class_name = "ZipLocksDO"
 enabled = true
 head_sampling_rate = 1
 
+[limits]
+cpu_ms = 300_000
+
 # Vars
 [env.prod.vars]
-SECRET_KEY = ""
+# SECRET_KEY = "" // Will be set from Secrets
 WEB_API_BASE_URL = "https://moretransfer.com"
 BASE_RETRY_DELAY_SECONDS = 30
 ZIP_OUTPUT_PREFIX = "bundle"
