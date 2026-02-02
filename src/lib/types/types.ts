@@ -13,6 +13,7 @@ export interface ZipJob {
   zipOutputKey?: string; // optional custom output key in OUTPUT_BUCKET
   includeEmpty?: boolean; // include zero-byte files (default true)
   createdBy?: string; // optional audit
+  files?: Array<{ key: string; relativePath?: string }>; // file mappings for folder structure
 }
 
 export enum TransferStatus {

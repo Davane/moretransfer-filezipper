@@ -67,6 +67,7 @@ export default {
       zipOutputKey: body.zipOutputKey,
       includeEmpty: body.includeEmpty ?? true,
       createdBy: body.createdBy ?? "api",
+      files: body.files,
     };
 
     try {
@@ -192,17 +193,26 @@ export class ZipLocksDO {
 
 async function processZipJob(job: ZipJob, env: Env) {
   const currentObjectPrefix = cleanPrefix(job.objectPrefix);
-  const zipOutputKey =
-    job.zipOutputKey ??
-    `${env.ZIP_OUTPUT_PREFIX}/${currentObjectPrefix.replace(/\/?$/, "")}/${
-      env.ZIP_OUTPUT_FILE_NAME
-    }.zip`;
+  const defaultZipOutputKey = `${env.ZIP_OUTPUT_PREFIX}/${currentObjectPrefix.replace(
+    /\/?$/,
+    ""
+  )}/${env.ZIP_OUTPUT_FILE_NAME}.zip`;
+
+  const zipOutputKey = job.zipOutputKey ?? defaultZipOutputKey;
   const maxFiles = toInt(env.MAX_FILES, 100);
   const maxZipBytes = toInt(env.MAX_ZIP_BYTES, 3000 * 1024 * 1024); // 3GB
+
+  // If a pre-baked ZIP already exists and is fresh enough, you could skip here.
+  const existing = await env.OUTPUT_BUCKET.head(zipOutputKey);
+  if (existing) {
+    console.log(`ZIP already exists: ${zipOutputKey}, skipping...`);
+    return zipOutputKey;
+  }
 
   // Per-prefix lock so two workers don’t create the same ZIP simultaneously
   const id = env.ZipLocks.idFromName(currentObjectPrefix);
   const stub = env.ZipLocks.get(id);
+
   console.log(`Locking source object key [${currentObjectPrefix}]. Stub ID [${id}].`);
   const lockResp = await stub.fetch("https://lock/lock", { method: "POST" });
   if (!lockResp.ok) {
@@ -211,9 +221,7 @@ async function processZipJob(job: ZipJob, env: Env) {
   }
 
   try {
-    // If a pre-baked ZIP already exists and is fresh enough, you could skip here.
-    // const existing = await env.OUTPUT_BUCKET.head(zipOutputKey);
-    // if (existing) {return;}
+    
 
     // Stream ZIP to R2 via multipart upload
     const mp = await env.OUTPUT_BUCKET.createMultipartUpload(zipOutputKey, {
@@ -241,6 +249,11 @@ async function processZipJob(job: ZipJob, env: Env) {
       throw new Error(`No objects found for prefix: ${currentObjectPrefix}`);
     }
 
+    // Build lookup map for relativePath (used to preserve folder structure in ZIP)
+    const filePathMap = new Map(
+      (job.files ?? []).map((f) => [f.key, f.relativePath])
+    );
+
     while (true) {
       for (const obj of listed.objects) {
         if (totalFiles >= maxFiles) {
@@ -261,14 +274,25 @@ async function processZipJob(job: ZipJob, env: Env) {
         }
 
         const key = obj.key;
-        const delimiterIndex = key.indexOf("__");
-        const uploadedFileName =
-          delimiterIndex >= 0 ? key.slice(delimiterIndex + 2, key.length) : "";
-        const nameInZip =
-          uploadedFileName || // Get the uploaded filename
-          key.substring(currentObjectPrefix.length).replace(/^\/+/, "") || // or use the last part of the key
-          obj.key.split("/").pop() || // or use the last part of the key
-          "file"; // else just use file
+
+        // Check if we have a relativePath from the file metadata (for folder uploads)
+        const relativePath = filePathMap.get(key);
+
+        let nameInZip: string;
+        if (relativePath) {
+          // Use the folder path from metadata to preserve folder structure
+          nameInZip = relativePath;
+        } else {
+          // Fallback to existing logic for backward compatibility
+          const delimiterIndex = key.indexOf("__");
+          const uploadedFileName =
+            delimiterIndex >= 0 ? key.slice(delimiterIndex + 2, key.length) : "";
+          nameInZip =
+            uploadedFileName || // Get the uploaded filename
+            key.substring(currentObjectPrefix.length).replace(/^\/+/, "") || // or use the last part of the key
+            obj.key.split("/").pop() || // or use the last part of the key
+            "file"; // else just use file
+        }
 
         const r = await env.SOURCE_BUCKET.get(key);
         if (!r?.body) {
@@ -293,14 +317,6 @@ async function processZipJob(job: ZipJob, env: Env) {
         cursor: listed.cursor,
       });
     }
-
-    // // Add a manifest file (optional)
-    // const manifest = JSON.stringify(
-    //   { prefix: currentObjectPrefix, totalFiles, totalBytes, createdAt: new Date().toISOString() },
-    //   null,
-    //   2
-    // );
-    // await addFile("manifest.json", new Blob([manifest]).stream());
 
     // Finalize the ZIP stream
     await finalize();
