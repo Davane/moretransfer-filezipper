@@ -49,6 +49,10 @@ MAX_ZIP_BYTES = "524288000"
 tag = "v1"
 new_classes = ["ZipLocksDO"]
 
+# Cron Triggers
+[env.dev.triggers]
+crons = ["*/5 * * * *"]
+
 # -----------------------------
 # PROD ENVIRONMENT
 # -----------------------------
@@ -106,3 +110,7 @@ MAX_ZIP_BYTES = "3145728000" # 3GB
 [[env.prod.migrations]]
 tag = "v1"
 new_classes = ["ZipLocksDO"]
+
+# Cron Triggers
+[env.prod.triggers]
+crons = ["0 */3 * * *"] # every 3 hours

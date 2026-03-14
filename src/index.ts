@@ -89,6 +89,29 @@ export default {
    * @param env - The environment variables
    * @param ctx - The execution context
    */
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    console.log("[scheduled] Triggering expired transfer cleanup ...");
+    const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
+    const body = { trigger: "scheduled", timestamp: Date.now() };
+    const headers = await webAPIService.getHeaderSignature(body);
+
+    const promise = fetch(
+      `${env.WEB_API_BASE_URL}/api/external/cron/cleanup-expired-transfers`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      }
+    ).then(async (res) => {
+      const text = await res.text();
+      console.log(`[scheduled] Cleanup response: ${res.status}`, text);
+    }).catch((err) => {
+      console.error("[scheduled] Cleanup request failed:", err);
+    });
+
+    ctx.waitUntil(promise);
+  },
+
   async queue(batch: MessageBatch<ZipJob>, env: Env, ctx: ExecutionContext) {
     const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
 
