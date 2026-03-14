@@ -27,7 +27,8 @@ export async function verifyHmac(req: Request, secret: string) {
   const now = Date.now();
   const t = Number.isFinite(+ts) ? +ts : Date.parse(ts);
   if (!Number.isFinite(t) || Math.abs(now - t) > MAX_SKEW_MS) {
-    throw new Response("Unauthorized (timing)", { status: 401 });
+    console.error("Unauthorized: Timestamp skew check failed");
+    throw new Response("Unauthorized", { status: 401 });
   }
 
   // 3) Import HMAC key
@@ -42,7 +43,8 @@ export async function verifyHmac(req: Request, secret: string) {
   const isVerified = await crypto.subtle.verify("HMAC", key, sigBytes, message);
 
   if (!isVerified) {
-    throw new Response("Unauthorized (signature)", { status: 401 });
+    console.error("Unauthorized: HMAC verification failed");
+    throw new Response("Unauthorized", { status: 401 });
   }
 }
 
