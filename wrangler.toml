@@ -99,7 +99,8 @@ cpu_ms = 300_000
 # Vars
 [env.prod.vars]
 # SECRET_KEY = "" // Will be set from Secrets
-WEB_API_BASE_URL = "https://moretransfer.com"
+# Use www (canonical); apex redirects to www via 301, which would convert POST→GET (405)
+WEB_API_BASE_URL = "https://www.moretransfer.com"
 BASE_RETRY_DELAY_SECONDS = 30
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"

@@ -90,24 +90,24 @@ export default {
    * @param ctx - The execution context
    */
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    console.log("[scheduled] Triggering expired transfer cleanup ...");
+    const now = Date.now();
+    console.log(`[scheduled] Triggering expired transfer cleanup at ${now} ...`);
     const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
-    const body = { trigger: "scheduled", timestamp: Date.now() };
+    const body = { trigger: "scheduled", timestamp: now };
     const headers = await webAPIService.getHeaderSignature(body);
 
-    const promise = fetch(
-      `${env.WEB_API_BASE_URL}/api/external/cron/cleanup-expired-transfers`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...headers },
-        body: JSON.stringify(body),
-      }
-    ).then(async (res) => {
-      const text = await res.text();
-      console.log(`[scheduled] Cleanup response: ${res.status}`, text);
-    }).catch((err) => {
-      console.error("[scheduled] Cleanup request failed:", err);
-    });
+    const promise = fetch(`${env.WEB_API_BASE_URL}/api/external/cron/cleanup-expired-transfers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    })
+      .then(async (res) => {
+        const text = await res.text();
+        console.log(`[scheduled] Cleanup response: ${res.status}`, text);
+      })
+      .catch((err) => {
+        console.error("[scheduled] Cleanup request failed:", err);
+      });
 
     ctx.waitUntil(promise);
   },
@@ -137,11 +137,11 @@ export default {
       } catch (err) {
         const delaySeconds = calculateExponentialBackoff(
           msg.attempts,
-          env.BASE_RETRY_DELAY_SECONDS
+          env.BASE_RETRY_DELAY_SECONDS,
         );
         console.error(
           `Compression job failed. Attempt: ${msg.attempts}. Retry in ${delaySeconds} seconds:`,
-          err
+          err,
         );
 
         msg.retry({ delaySeconds });
@@ -151,7 +151,7 @@ export default {
             // Update the transfer status.
             await webAPIService.updateTransferStatus(
               messagePayload.transferId,
-              transferStatusPayload
+              transferStatusPayload,
             );
           } catch (error) {
             // If failed we dont want to redo the bundling process.
@@ -218,7 +218,7 @@ async function processZipJob(job: ZipJob, env: Env) {
   const currentObjectPrefix = cleanPrefix(job.objectPrefix);
   const defaultZipOutputKey = `${env.ZIP_OUTPUT_PREFIX}/${currentObjectPrefix.replace(
     /\/?$/,
-    ""
+    "",
   )}/${env.ZIP_OUTPUT_FILE_NAME}.zip`;
 
   const zipOutputKey = job.zipOutputKey ?? defaultZipOutputKey;
@@ -244,8 +244,6 @@ async function processZipJob(job: ZipJob, env: Env) {
   }
 
   try {
-    
-
     // Stream ZIP to R2 via multipart upload
     const mp = await env.OUTPUT_BUCKET.createMultipartUpload(zipOutputKey, {
       // You can set httpMetadata or customMetadata if you want
@@ -273,9 +271,7 @@ async function processZipJob(job: ZipJob, env: Env) {
     }
 
     // Build lookup map for relativePath (used to preserve folder structure in ZIP)
-    const filePathMap = new Map(
-      (job.files ?? []).map((f) => [f.key, f.relativePath])
-    );
+    const filePathMap = new Map((job.files ?? []).map((f) => [f.key, f.relativePath]));
 
     while (true) {
       for (const obj of listed.objects) {
@@ -408,7 +404,7 @@ function createZipStream() {
 async function pumpToMultipart(
   bucket: R2Bucket,
   multipartUpload: R2MultipartUpload,
-  stream: ReadableStream<Uint8Array>
+  stream: ReadableStream<Uint8Array>,
 ) {
   const reader = stream.getReader();
 
