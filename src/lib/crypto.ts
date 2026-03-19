@@ -20,31 +20,26 @@ export async function verifyHmac(req: Request, secret: string) {
   const sig = req.headers.get("x-signature");
   const ts = req.headers.get("x-timestamp");
   if (!sig || !ts) {
-    throw new Response("Unauthorized", { status: 401 });
+    throw new Error("Missing x-signature or x-timestamp headers");
   }
 
-  // 1) Timestamp skew check (use parsed number only for the check)
   const now = Date.now();
   const t = Number.isFinite(+ts) ? +ts : Date.parse(ts);
   if (!Number.isFinite(t) || Math.abs(now - t) > MAX_SKEW_MS) {
-    console.error("Unauthorized: Timestamp skew check failed");
-    throw new Response("Unauthorized", { status: 401 });
+    throw new Error(`Timestamp skew check failed: skew=${Math.abs(now - t)}ms, max=${MAX_SKEW_MS}ms`);
   }
 
-  // 3) Import HMAC key
   const enc = new TextEncoder();
   const key = await importKey(secret, ["verify"], enc);
 
-  // 2) Rebuild the exact message that the Node app signed
-  const body = await req.clone().text(); // Raw body string
+  const body = await req.clone().text();
   const message = enc.encode(`${ts}\n${body}`);
 
   const sigBytes = hexToBytes(sig);
   const isVerified = await crypto.subtle.verify("HMAC", key, sigBytes, message);
 
   if (!isVerified) {
-    console.error("Unauthorized: HMAC verification failed");
-    throw new Response("Unauthorized", { status: 401 });
+    throw new Error("HMAC signature mismatch");
   }
 }
 
