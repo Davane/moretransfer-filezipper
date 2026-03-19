@@ -35,8 +35,8 @@ export default {
     } else {
       try {
         await verifyHmac(req, env.SECRET_KEY);
-      } catch (error) {
-        console.error("HMAC verification failed:", error);
+      } catch (error: any) {
+        console.error("HMAC verification failed:", error?.message, error);
         return new Response("Unauthorized", { status: 401 });
       }
     }
