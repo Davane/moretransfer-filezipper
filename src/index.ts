@@ -81,6 +81,7 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     const now = Date.now();
     console.log(`[scheduled] Cron triggered: "${event.cron}" at ${now}`);
+
     const cronHandler = new CronHandler(env);
     const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
 

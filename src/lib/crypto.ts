@@ -1,7 +1,7 @@
 /**
  * This file created and verifies HMAC signatures on edge runtime
  */
-const MAX_SKEW_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_SKEW_MS = 1 * 60 * 1000; // 1 minute
 
 async function importKey(secret: string, keyUsage: string[], encoder?: TextEncoder) {
   const enc = encoder || new TextEncoder();
