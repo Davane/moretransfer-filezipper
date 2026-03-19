@@ -1,6 +1,12 @@
-import { Env, QueueMessage, TransferStatus, TransferUpdateRequest, ZipJob } from "./types/types";
+import {
+  Env,
+  QueueMessage,
+  TransferStatus,
+  TransferUpdateRequest,
+  ZipJob,
+} from "../lib/types/types";
 import { WebAPIService } from "./web-api-service";
-import { calculateExponentialBackoff } from "./utils";
+import { calculateExponentialBackoff } from "../lib/utils";
 import { Zip, ZipPassThrough } from "fflate";
 
 export class Zipper {

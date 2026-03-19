@@ -1,7 +1,7 @@
-import { COMPANY_NAME } from "./constants";
-import { createHmacSha256Hex } from "./crypto";
-import { TransferUpdateRequest } from "./types/types";
-import { createSafeUploadKey, fetchWithCredentials, slugify } from "./utils";
+import { COMPANY_NAME } from "../lib/constants";
+import { createHmacSha256Hex } from "../lib/crypto";
+import { TransferUpdateRequest } from "../lib/types/types";
+import { createSafeUploadKey, fetchWithCredentials, slugify } from "../lib/utils";
 
 export enum NextApiErrorCode {
   TransferSessionException = "TransferSessionException",

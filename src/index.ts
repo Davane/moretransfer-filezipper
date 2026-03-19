@@ -6,9 +6,9 @@ import {
   ZipJob,
 } from "./lib/types/types";
 import { verifyHmac } from "./lib/crypto";
-import { WebAPIService } from "./lib/web-api-service";
-import { Zipper } from "./lib/zipper";
-import { CronHandler } from "./lib/cron";
+import { WebAPIService } from "./modules/web-api-service";
+import { Zipper } from "./modules/zipper";
+import { CronHandler } from "./modules/cron";
 
 // export type { Env } from "./lib/types/types"
 

@@ -1,4 +1,4 @@
-import { Env } from "..";
+import { Env } from "../lib/types/types";
 import { WebAPIService } from "./web-api-service";
 
 export class CronHandler {
