@@ -56,6 +56,17 @@ class WebAPIService {
     }
   }
 
+  async sendCleanupExpiredTransfersRequest(body: Record<string, any>) {
+    const url = `${this._baseUrl}/api/external/cron/cleanup-expired-transfers`;
+    const headers = await this.getHeaderSignature(body);
+
+    return await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+  }
+
   /**
    * Get the payload for the file compression job
    */
@@ -70,7 +81,7 @@ class WebAPIService {
     const outputKey = createSafeUploadKey(
       transferId,
       `${slugify(COMPANY_NAME)}_${filename}_${date}.zip`,
-      "compressed"
+      "compressed",
     );
 
     const payload = {
