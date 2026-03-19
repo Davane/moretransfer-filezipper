@@ -91,6 +91,12 @@ export default {
         break;
       }
 
+      // Daily at 9 AM UTC
+      case "0 9 * * *": {
+        ctx.waitUntil(cronHandler.handleExpiryReminderCron(webAPIService, now));
+        break;
+      }
+
       default:
         console.warn(`[scheduled] Unhandled cron schedule: "${event.cron}"`);
     }

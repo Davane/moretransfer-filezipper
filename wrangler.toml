@@ -51,7 +51,7 @@ new_classes = ["ZipLocksDO"]
 
 # Cron Triggers
 [env.dev.triggers]
-crons = ["0 */3 * * *"]
+crons = ["0 */3 * * *", "0 9 * * *"]
 
 # -----------------------------
 # PROD ENVIRONMENT
@@ -114,4 +114,4 @@ new_classes = ["ZipLocksDO"]
 
 # Cron Triggers
 [env.prod.triggers]
-crons = ["0 */3 * * *"] # every 3 hours
+crons = ["0 */3 * * *", "0 9 * * *"] # every 3 hours + daily 9 AM UTC
