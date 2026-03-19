@@ -3,7 +3,7 @@ export interface Env {
   OUTPUT_BUCKET: R2Bucket;
 
   // Queues
-  QUEUE_FILE_ZIPPER: Queue;
+  QUEUE_WORKER_MAIN: Queue;
 
   // Durable Object
   ZipLocks: DurableObjectNamespace;

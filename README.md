@@ -49,7 +49,7 @@ Set these in your `wrangler.toml` or via the Cloudflare dashboard:
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd file-zipper
+cd moretransfer-worker
 ```
 
 2. Install dependencies:
@@ -122,7 +122,7 @@ npm run wrangler:deploy
 ### Project Structure
 
 ```
-file-zipper/
+moretransfer-worker/
 ├── src/
 │   └── index.ts          # Main worker code
 ├── package.json          # Dependencies and scripts

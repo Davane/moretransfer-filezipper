@@ -1,4 +1,4 @@
-name = "file-zipper"
+name = "moretransfer-worker"
 main = "src/index.ts"
 compatibility_date = "2025-08-15"
 workers_dev = true
@@ -7,7 +7,7 @@ workers_dev = true
 # DEV ENVIRONMENT
 # -----------------------------
 [env.dev]
-name = "file-zipper-dev"
+name = "moretransfer-worker-dev"
 
 # R2
 [[env.dev.r2_buckets]]
@@ -20,14 +20,14 @@ bucket_name = "moretransfer-dev"
 
 # Queues
 [[env.dev.queues.consumers]]
-queue = "moretransfer-file-zipper-dev"
+queue = "moretransfer-worker-queue-dev"
 max_batch_size = 1
 max_retries = 3
-dead_letter_queue = "moretransfer-file-zipper-dev-dlq"
+dead_letter_queue = "moretransfer-worke-queue-dev-dlq"
 
 [[env.dev.queues.producers]]
-binding = "QUEUE_FILE_ZIPPER"
-queue = "moretransfer-file-zipper-dev"
+binding = "QUEUE_WORKER_MAIN"
+queue = "moretransfer-worker-queue-dev"
 
 # Durable Objects
 [[env.dev.durable_objects.bindings]]
@@ -51,13 +51,13 @@ new_classes = ["ZipLocksDO"]
 
 # Cron Triggers
 [env.dev.triggers]
-crons = ["*/5 * * * *"]
+crons = ["0 */3 * * *"]
 
 # -----------------------------
 # PROD ENVIRONMENT
 # -----------------------------
 [env.prod]
-name = "moretransfer-file-zipper-prod"
+name = "moretransfer-worker-prod"
 
 # [[env.prod.routes]]
 # pattern = "shop.example.com"
@@ -74,14 +74,14 @@ bucket_name = "moretransfer-storage"
 
 # Queues
 [[env.prod.queues.consumers]]
-queue = "moretransfer-file-zipper"
+queue = "moretransfer-worker-queue"
 max_batch_size = 1
 max_retries = 3
-dead_letter_queue = "moretransfer-file-zipper-dlq"
+dead_letter_queue = "moretransfer-worker-queue-dlq"
 
 [[env.prod.queues.producers]]
-binding = "QUEUE_FILE_ZIPPER"
-queue = "moretransfer-file-zipper"
+binding = "QUEUE_WORKER_MAIN"
+queue = "moretransfer-worker-queue"
 
 # Durable Objects
 [[env.prod.durable_objects.bindings]]

@@ -1,5 +1,5 @@
 import {
-  Env as BaseEnv,
+  Env,
   QueueMessage,
   QueueMessageType,
   RequestPath,
@@ -10,7 +10,7 @@ import { WebAPIService } from "./lib/web-api-service";
 import { Zipper } from "./lib/zipper";
 import { CronHandler } from "./lib/cron";
 
-export interface Env extends BaseEnv {}
+// export type { Env } from "./lib/types/types"
 
 export default {
   /**
@@ -60,7 +60,8 @@ export default {
     try {
       const message: QueueMessage = { type: QueueMessageType.ZIP, data: job };
       console.log("Sending job to queue:", JSON.stringify(message));
-      await env.QUEUE_FILE_ZIPPER.send(message);
+      
+      await env.QUEUE_WORKER_MAIN.send(message);
       console.log("Job queued", JSON.stringify(message));
     } catch (error) {
       console.error("Failed to enqueue job:", error);
