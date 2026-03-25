@@ -6,7 +6,7 @@
   "scripts": {
     "login": "login",
     "dev": "wrangler dev --env dev",
-    "cron:dev": "wrangler dev --env dev --test-scheduled",
+    "dev:cron": "wrangler dev --env dev --test-scheduled",
     "dev:no-auth": "wrangler dev --env dev --var \"SKIP_REQUEST_VERIFICATION:true\"",
     "cron:cleanup": "curl \"http://localhost:8787/__scheduled?cron=0+*%2F3+*+*+*\"",
     "cron:email:reminder": "curl \"http://localhost:8787/__scheduled?cron=0+9+*+*+*\"",
