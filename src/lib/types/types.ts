@@ -17,10 +17,15 @@ export interface Env {
   MAX_ZIP_BYTES?: string;
   BASE_RETRY_DELAY_SECONDS: number;
   SKIP_REQUEST_VERIFICATION: boolean | undefined;
+
+  // Cloudflare Stream
+  CLOUDFLARE_ACCOUNT_ID: string;
+  CLOUDFLARE_STREAM_API_TOKEN: string;
 }
 
 export enum RequestPath {
   COMPRESS_FILES = "/compress-files",
+  STREAM_INGEST = "/stream-ingest",
 }
 
 export type RequestCredentials = "include" | "omit" | "same-origin";
@@ -32,6 +37,18 @@ export interface ZipJob {
   includeEmpty?: boolean; // include zero-byte files (default true)
   createdBy?: string; // optional audit
   files?: Array<{ key: string; relativePath?: string }>; // file mappings for folder structure
+}
+
+export interface StreamIngestJob {
+  transferId: string;
+  fileId: string;
+  r2PresignedGetUrl: string;
+  meta: {
+    transferId: string;
+    fileId: string;
+    filename?: string;
+    mimeType?: string;
+  };
 }
 
 export enum TransferStatus {
@@ -49,6 +66,7 @@ export interface TransferUpdateRequest {
 
 export enum QueueMessageType {
   ZIP = "zip",
+  STREAM_INGEST = "stream_ingest",
 }
 
 interface ZipMessage {
@@ -56,4 +74,9 @@ interface ZipMessage {
   data: ZipJob;
 }
 
-export type QueueMessage = ZipMessage;
+interface StreamIngestMessage {
+  type: QueueMessageType.STREAM_INGEST;
+  data: StreamIngestJob;
+}
+
+export type QueueMessage = ZipMessage | StreamIngestMessage;
