@@ -106,6 +106,9 @@ ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "500"
 MAX_ZIP_BYTES = "3145728000" # 3GB
+# CLOUDFLARE_ACCOUNT_ID = "" # is stored as a Worker secret
+# CLOUDFLARE_STREAM_API_TOKEN is stored as a Worker secret
+# wrangler secret put CLOUDFLARE_STREAM_API_TOKEN --env prod
 
 # DO migrations (per env)
 [[env.prod.migrations]]

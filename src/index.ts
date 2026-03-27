@@ -9,6 +9,7 @@ import { verifyHmac } from "./lib/crypto";
 import { WebAPIService } from "./modules/web-api-service";
 import { Zipper } from "./modules/zipper";
 import { CronHandler } from "./modules/cron";
+import { StreamIngestor } from "./modules/stream-ingestor";
 
 // export type { Env } from "./lib/types/types"
 
@@ -26,7 +27,7 @@ export default {
     const url = new URL(req.url);
     console.log(`Executing worker for url ${url.pathname}`);
 
-    if (url.pathname !== RequestPath.COMPRESS_FILES) {
+    if (![RequestPath.COMPRESS_FILES, RequestPath.STREAM_INGEST].includes(url.pathname as any)) {
       return new Response(undefined, { status: 404 });
     }
 
@@ -41,28 +42,41 @@ export default {
       }
     }
 
-    const body = await req.json<ZipJob>();
-    console.log("Compressing files:", JSON.stringify(body));
-
-    if (!body.objectPrefix) {
-      return new Response("Missing prefix", { status: 400 });
-    }
-
-    const job: ZipJob = {
-      transferId: body.transferId,
-      objectPrefix: body.objectPrefix,
-      zipOutputKey: body.zipOutputKey,
-      includeEmpty: body.includeEmpty ?? true,
-      createdBy: body.createdBy ?? "api",
-      files: body.files,
-    };
-
     try {
-      const message: QueueMessage = { type: QueueMessageType.ZIP, data: job };
-      console.log("Sending job to queue:", JSON.stringify(message));
-      
-      await env.QUEUE_WORKER_MAIN.send(message);
-      console.log("Job queued", JSON.stringify(message));
+      if (url.pathname === RequestPath.COMPRESS_FILES) {
+        const body = await req.json<ZipJob>();
+        console.log("Compressing files:", JSON.stringify(body));
+
+        if (!body.objectPrefix) {
+          return new Response("Missing prefix", { status: 400 });
+        }
+
+        const job: ZipJob = {
+          transferId: body.transferId,
+          objectPrefix: body.objectPrefix,
+          zipOutputKey: body.zipOutputKey,
+          includeEmpty: body.includeEmpty ?? true,
+          createdBy: body.createdBy ?? "api",
+          files: body.files,
+        };
+
+        const message: QueueMessage = { type: QueueMessageType.ZIP, data: job };
+        console.log("Sending job to queue:", JSON.stringify(message));
+        await env.QUEUE_WORKER_MAIN.send(message);
+        console.log("Job queued", JSON.stringify(message));
+      } else if (url.pathname === RequestPath.STREAM_INGEST) {
+        const body = await req.json<any>();
+        console.log("Stream ingest request:", JSON.stringify(body));
+
+        if (!body?.transferId || !body?.fileId || !body?.r2PresignedGetUrl) {
+          return new Response("Missing required fields", { status: 400 });
+        }
+
+        const message: QueueMessage = { type: QueueMessageType.STREAM_INGEST, data: body };
+        console.log("Sending stream ingest job to queue:", JSON.stringify(message));
+        await env.QUEUE_WORKER_MAIN.send(message);
+        console.log("Stream ingest job queued", JSON.stringify(message));
+      }
     } catch (error) {
       console.error("Failed to enqueue job:", error);
       return new Response("Failed to enqueue job", { status: 500 });
@@ -84,16 +98,13 @@ export default {
     const cronHandler = new CronHandler(env);
     const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
 
-    switch (event.cron) {
+    if (event.cron === "0 */3 * * *") {
       // Every 3 hours
-      case "0 */3 * * *": {
-        ctx.waitUntil(cronHandler.handleCleanupExpiredTransfersCron(webAPIService, now));
-        break;
-      }
-
-      default:
-        console.warn(`[scheduled] Unhandled cron schedule: "${event.cron}"`);
+      ctx.waitUntil(cronHandler.handleCleanupExpiredTransfersCron(webAPIService, now));
+      return;
     }
+
+    console.warn(`[scheduled] Unhandled cron schedule: "${event.cron}"`);
   },
 
   async queue(batch: MessageBatch<QueueMessage>, env: Env, ctx: ExecutionContext) {
@@ -102,13 +113,13 @@ export default {
     for (const msg of batch.messages) {
       console.log(`Processing message ${msg.id} from batch`, JSON.stringify(msg.body));
 
-      switch (msg.body.type) {
-        case QueueMessageType.ZIP:
-          await new Zipper(env).zip(msg, webAPIService);
-          break;
-        default:
-          console.error(`Unknown message type: ${(msg.body as any).type}`);
-          msg.ack();
+      if (msg.body.type === QueueMessageType.ZIP) {
+        await new Zipper(env).zip(msg, webAPIService);
+      } else if (msg.body.type === QueueMessageType.STREAM_INGEST) {
+        await new StreamIngestor(env).ingest(msg);
+      } else {
+        console.error(`Unknown message type: ${(msg.body as any).type}`);
+        msg.ack();
       }
     }
   },
