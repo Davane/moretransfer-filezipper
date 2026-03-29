@@ -106,6 +106,12 @@ export default {
         break;
       }
 
+      // Every 30 minutes
+      case "*/30 * * * *": {
+        ctx.waitUntil(cronHandler.handleReviewCommentDigestCron(webAPIService, now));
+        break;
+      }
+
       default:
         console.warn(`[scheduled] Unhandled cron schedule: "${event.cron}"`);
     }
