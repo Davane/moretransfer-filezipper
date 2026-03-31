@@ -1,10 +1,4 @@
-import {
-  Env,
-  QueueMessage,
-  QueueMessageType,
-  RequestPath,
-  ZipJob,
-} from "./lib/types/types";
+import { Env, QueueMessage, QueueMessageType, RequestPath, ZipJob } from "./lib/types/types";
 import { verifyHmac } from "./lib/crypto";
 import { WebAPIService } from "./modules/web-api-service";
 import { Zipper } from "./modules/zipper";
@@ -95,16 +89,32 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     const now = Date.now();
     console.log(`[scheduled] Cron triggered: "${event.cron}" at ${now}`);
+
     const cronHandler = new CronHandler(env);
     const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
 
-    if (event.cron === "0 */3 * * *") {
+    switch (event.cron) {
       // Every 3 hours
-      ctx.waitUntil(cronHandler.handleCleanupExpiredTransfersCron(webAPIService, now));
-      return;
-    }
+      case "0 */3 * * *": {
+        ctx.waitUntil(cronHandler.handleCleanupExpiredTransfersCron(webAPIService, now));
+        break;
+      }
 
-    console.warn(`[scheduled] Unhandled cron schedule: "${event.cron}"`);
+      // Daily at 9 AM UTC
+      case "0 9 * * *": {
+        ctx.waitUntil(cronHandler.handleExpiryReminderCron(webAPIService, now));
+        break;
+      }
+
+      // Every 30 minutes
+      case "*/30 * * * *": {
+        ctx.waitUntil(cronHandler.handleReviewCommentDigestCron(webAPIService, now));
+        break;
+      }
+
+      default:
+        console.warn(`[scheduled] Unhandled cron schedule: "${event.cron}"`);
+    }
   },
 
   async queue(batch: MessageBatch<QueueMessage>, env: Env, ctx: ExecutionContext) {
