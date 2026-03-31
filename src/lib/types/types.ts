@@ -43,6 +43,15 @@ export interface StreamIngestJob {
   transferId: string;
   fileId: string;
   r2PresignedGetUrl: string;
+  /**
+   * Used to set Stream `creator` and `Upload-Creator` header.
+   * Optional because transfers may have null userId (e.g. deleted user).
+   */
+  transferUserId?: string | null;
+  /**
+   * ISO string of transfers.expiresAt; used to set Stream scheduledDeletion.
+   */
+  transferExpiresAt?: string;
   meta: {
     transferId: string;
     fileId: string;

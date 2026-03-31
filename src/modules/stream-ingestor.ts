@@ -53,36 +53,100 @@ export class StreamIngestor {
     }
   }
 
+  private isDev(): boolean {
+    return this.env.WEB_API_BASE_URL.includes("localhost");
+  }
+
+  private getAllowedOrigins(): string[] {
+    const isDev = this.isDev();
+    const allowedOrigins = ["moretransfer.com", "www.moretransfer.com"];
+
+    if (isDev) {
+      allowedOrigins.push("localhost:3000");
+    }
+
+    return allowedOrigins;
+  }
+
+  private getStreamDisplayName(fileId: string): string {
+    const isDev = this.isDev();
+    return isDev ? `dev_fi_${fileId}` : `fi_${fileId}`;
+  }
+
+  private getCreator(transferUserId: string | null | undefined): string | undefined {
+    return typeof transferUserId === "string" && transferUserId.trim().length > 0
+      ? transferUserId.trim()
+      : undefined;
+  }
+
+  private getScheduledDeletion(transferExpiresAt: string | undefined): string | undefined {
+    if (!transferExpiresAt) {
+      return undefined;
+    }
+    let scheduledDeletion: string | undefined;
+    const expiresAt = new Date(transferExpiresAt);
+    if (Number.isNaN(expiresAt.getTime())) {
+      console.warn(
+        `[stream] Invalid transferExpiresAt, skipping scheduledDeletion: ${transferExpiresAt}`,
+      );
+    } else {
+      // Cloudflare requires deletion at least 30 days after upload (Minimum retention period is 30 days).
+      const minMs = Date.now() + 30 * 24 * 60 * 60 * 1000;
+      scheduledDeletion = new Date(Math.max(expiresAt.getTime(), minMs)).toISOString();
+    }
+
+    return scheduledDeletion;
+  }
+
   private async copyFromMediaUrlToStreamService(job: StreamIngestJob): Promise<StreamVideo> {
     if (!this.env.CLOUDFLARE_ACCOUNT_ID || !this.env.CLOUDFLARE_STREAM_API_TOKEN) {
       throw new Error("Missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_STREAM_API_TOKEN");
     }
 
     const url = `https://api.cloudflare.com/client/v4/accounts/${this.env.CLOUDFLARE_ACCOUNT_ID}/stream/copy`;
-    const body = {
+    const allowedOrigins = this.getAllowedOrigins();
+    const streamDisplayName = this.getStreamDisplayName(job.fileId);
+    const creator = this.getCreator(job.transferUserId);
+    const scheduledDeletion = this.getScheduledDeletion(job.transferExpiresAt);
+
+    const body: Record<string, unknown> = {
       url: job.r2PresignedGetUrl,
-      meta: job.meta,
+      meta: { ...job.meta, name: streamDisplayName },
       requireSignedURLs: false,
+      allowedOrigins,
     };
+
+    if (creator) {
+      body.creator = creator;
+    }
+    if (scheduledDeletion) {
+      body.scheduledDeletion = scheduledDeletion;
+    }
+
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      authorization: `Bearer ${this.env.CLOUDFLARE_STREAM_API_TOKEN}`,
+    };
+    if (creator) {
+      headers["Upload-Creator"] = creator;
+    }
 
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.env.CLOUDFLARE_STREAM_API_TOKEN}`,
-      },
+      headers,
       body: JSON.stringify(body),
     });
 
     const data = (await res.json().catch(() => ({}))) as CloudflareApiResponse<StreamVideo>;
     if (!res.ok || !data.success || !data.result) {
       const errMsg =
-        data?.errors?.map((e) => e.message).filter(Boolean).join("; ") ||
-        `HTTP ${res.status} ${res.statusText}`;
+        data?.errors
+          ?.map((e) => e.message)
+          .filter(Boolean)
+          .join("; ") || `HTTP ${res.status} ${res.statusText}`;
       throw new Error(`[stream] Cloudflare API error: ${errMsg}`);
     }
 
     return data.result;
   }
 }
-
