@@ -21,6 +21,8 @@ export interface Env {
   // Cloudflare Stream
   CLOUDFLARE_ACCOUNT_ID: string;
   CLOUDFLARE_STREAM_API_TOKEN: string;
+  /** Set to "false" to ingest with public playback URLs (rollback). Omit or any other value = signed URLs required. */
+  STREAM_REQUIRE_SIGNED_URLS: boolean | undefined;
 }
 
 export enum RequestPath {

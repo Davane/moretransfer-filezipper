@@ -108,11 +108,12 @@ export class StreamIngestor {
     const streamDisplayName = this.getStreamDisplayName(job.fileId);
     const creator = this.getCreator(job.transferUserId);
     const scheduledDeletion = this.getScheduledDeletion(job.transferExpiresAt);
+    const requireSignedURLs = this.env.STREAM_REQUIRE_SIGNED_URLS === true;
 
     const body: Record<string, unknown> = {
       url: job.r2PresignedGetUrl,
       meta: { ...job.meta, name: streamDisplayName },
-      requireSignedURLs: false,
+      requireSignedURLs,
       allowedOrigins,
     };
 

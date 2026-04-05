@@ -36,13 +36,18 @@ class_name = "ZipLocksDO"
 
 # Vars
 [env.dev.vars]
-SECRET_KEY = ""
 WEB_API_BASE_URL = "http://localhost:3000"
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "500"
 BASE_RETRY_DELAY_SECONDS = 30
 MAX_ZIP_BYTES = "524288000"
+STREAM_REQUIRE_SIGNED_URLS = true
+
+# Secret used in the API
+SECRET_KEY = ""
+CLOUDFLARE_ACCOUNT_ID = "" 
+CLOUDFLARE_STREAM_API_TOKEN = ""
 
 # DO migrations (per env)
 [[env.dev.migrations]]
@@ -98,7 +103,6 @@ cpu_ms = 300_000
 
 # Vars
 [env.prod.vars]
-# SECRET_KEY = "" // Will be set from Secrets
 # Use www (canonical); apex redirects to www via 301, which would convert POST→GET (405)
 WEB_API_BASE_URL = "https://www.moretransfer.com"
 BASE_RETRY_DELAY_SECONDS = 30
@@ -106,9 +110,15 @@ ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "500"
 MAX_ZIP_BYTES = "3145728000" # 3GB
-# CLOUDFLARE_ACCOUNT_ID = "" # is stored as a Worker secret
-# CLOUDFLARE_STREAM_API_TOKEN is stored as a Worker secret
-# wrangler secret put CLOUDFLARE_STREAM_API_TOKEN --env prod
+
+# Requires signing to preview videos from Cloudflare Stream 
+# (set to false to allow public playback during ingest)
+STREAM_REQUIRE_SIGNED_URLS=true 
+
+# Stored in Secret - wrangler secret put CLOUDFLARE_STREAM_API_TOKEN --env prod
+# SECRET_KEY = "" 
+# CLOUDFLARE_ACCOUNT_ID = ""
+# CLOUDFLARE_STREAM_API_TOKEN = ""
 
 # DO migrations (per env)
 [[env.prod.migrations]]
