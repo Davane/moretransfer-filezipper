@@ -41,7 +41,7 @@ ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "500"
 BASE_RETRY_DELAY_SECONDS = 30
-MAX_ZIP_BYTES = "524288000"
+MAX_ZIP_BYTES = "68719476736" // 64 GiB
 STREAM_REQUIRE_SIGNED_URLS = true
 
 # Secret used in the API
@@ -109,7 +109,7 @@ BASE_RETRY_DELAY_SECONDS = 30
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle"
 MAX_FILES = "500"
-MAX_ZIP_BYTES = "3145728000" # 3GB
+MAX_ZIP_BYTES = "68719476736" # 64 GiB
 
 # Requires signing to preview videos from Cloudflare Stream 
 # (set to false to allow public playback during ingest)
