@@ -37,3 +37,21 @@ export async function fetchWithCredentials<T>(endpoint: string, options: Request
 export function calculateExponentialBackoff(attempts: number, baseDelaySeconds: number) {
   return baseDelaySeconds ** attempts;
 }
+
+export function resolveNameInZip(key: string, objectPrefix: string, relativePath?: string): string {
+  if (relativePath) {
+    return relativePath;
+  }
+
+  // Remove leading and trailing slashes from the object prefix
+  const currentObjectPrefix = objectPrefix.replace(/^\/+/, "").replace(/\/?$/, "/");
+  const delimiterIndex = key.indexOf("__");
+  const uploadedFileName = delimiterIndex >= 0 ? key.slice(delimiterIndex + 2) : "";
+
+  return (
+    uploadedFileName ||
+    key.substring(currentObjectPrefix.length).replace(/^\/+/, "") ||
+    key.split("/").pop() ||
+    "file"
+  );
+}

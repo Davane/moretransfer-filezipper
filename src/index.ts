@@ -1,11 +1,23 @@
-import { Env, QueueMessage, QueueMessageType, RequestPath, ZipJob } from "./lib/types/types";
+import {
+  Env,
+  QueueMessage,
+  QueueMessageType,
+  RequestPath,
+  ZipJob,
+  ZipV2TickMessageData,
+} from "./lib/types/types";
 import { verifyHmac } from "./lib/crypto";
 import { WebAPIService } from "./modules/web-api-service";
 import { Zipper } from "./modules/zipper";
 import { CronHandler } from "./modules/cron";
 import { StreamIngestor } from "./modules/stream-ingestor";
+import { resolveOutputKey, writeZipManifest, toBool } from "./modules/job-manifest";
+import { JobManagerDO } from "./modules/job-manager-do";
+import { ZipSemaphoreDO } from "./modules/semaphore-do";
+import { ZipContainerDO, ContainerProxy } from "./modules/zip-container";
 
 // export type { Env } from "./lib/types/types"
+export { ContainerProxy };
 
 export default {
   /**
@@ -54,10 +66,41 @@ export default {
           files: body.files,
         };
 
-        const message: QueueMessage = { type: QueueMessageType.ZIP, data: job };
-        console.log("Sending job to queue:", JSON.stringify(message));
-        await env.QUEUE_WORKER_MAIN.send(message);
-        console.log("Job queued", JSON.stringify(message));
+        const useV2 = toBool(env.ZIP_USE_CONTAINERS, false);
+        if (!useV2) {
+          const message: QueueMessage = { type: QueueMessageType.ZIP, data: job };
+          console.log("Sending job to queue:", JSON.stringify(message));
+          await env.QUEUE_WORKER_MAIN.send(message);
+          console.log("Job queued", JSON.stringify(message));
+        } else {
+          const jobId = crypto.randomUUID();
+          const outputKey = resolveOutputKey(env, job);
+          const { manifestKey } = await writeZipManifest({
+            env,
+            jobId,
+            zipJob: job,
+            outputKey,
+          });
+
+          const jobManagerId = env.JobManager.idFromName(jobId);
+          const jobManager = env.JobManager.get(jobManagerId);
+          await jobManager.fetch("https://job/start", {
+            method: "POST",
+            body: JSON.stringify({
+              jobId,
+              transferId: job.transferId,
+              manifestKey,
+              outputKey,
+            }),
+          });
+
+          const tick: ZipV2TickMessageData = { jobId };
+          const message: QueueMessage = { type: QueueMessageType.ZIP_V2_TICK, data: tick };
+          console.log("Sending zip v2 tick to queue:", JSON.stringify(message));
+          
+          await env.QUEUE_WORKER_MAIN.send(message);
+          console.log("Zip v2 job queued", JSON.stringify({ jobId, manifestKey, outputKey }));
+        }
       } else if (url.pathname === RequestPath.STREAM_INGEST) {
         const body = await req.json<any>();
         console.log("Stream ingest request:", JSON.stringify(body));
@@ -125,6 +168,26 @@ export default {
 
       if (msg.body.type === QueueMessageType.ZIP) {
         await new Zipper(env).zip(msg, webAPIService);
+      } else if (msg.body.type === QueueMessageType.ZIP_V2_TICK) {
+        const { jobId } = msg.body.data;
+        try {
+          const id = env.JobManager.idFromName(jobId);
+          const stub = env.JobManager.get(id);
+          const resp = await stub.fetch("https://job/tick", {
+            method: "POST",
+            body: JSON.stringify({ jobId }),
+          });
+          const result = (await resp.json()) as { done: boolean; status: string };
+          if (result.done) {
+            msg.ack();
+          } else {
+            // Requeue via retry with a small delay to avoid tight loops.
+            msg.retry({ delaySeconds: 15 });
+          }
+        } catch (e) {
+          console.error("[zip-v2] tick failed:", e);
+          msg.retry({ delaySeconds: 30 });
+        }
       } else if (msg.body.type === QueueMessageType.STREAM_INGEST) {
         await new StreamIngestor(env).ingest(msg);
       } else {
@@ -182,3 +245,5 @@ export class ZipLocksDO {
     await this.state.storage.deleteAlarm();
   }
 }
+
+export { JobManagerDO, ZipSemaphoreDO, ZipContainerDO };

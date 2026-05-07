@@ -7,6 +7,9 @@ export interface Env {
 
   // Durable Object
   ZipLocks: DurableObjectNamespace;
+  JobManager: DurableObjectNamespace;
+  ZipSemaphore: DurableObjectNamespace;
+  ZipContainer: DurableObjectNamespace;
 
   // Environment variables
   SECRET_KEY: string;
@@ -17,6 +20,13 @@ export interface Env {
   MAX_ZIP_BYTES?: string;
   BASE_RETRY_DELAY_SECONDS: number;
   SKIP_REQUEST_VERIFICATION: boolean | undefined;
+
+  // ZIP v2 (containers)
+  ZIP_USE_CONTAINERS?: boolean | undefined;
+  ZIP_GLOBAL_CONCURRENCY?: string | undefined; // default 1
+  ZIP_MANIFEST_PREFIX?: string | undefined; // default "manifests"
+  ZIP_PART_SIZE_BYTES?: string | undefined; // default 134217728 (128 MiB)
+  ZIP_MAX_PARTS_PER_TICK?: string | undefined; // default 8
 
   // Cloudflare Stream
   CLOUDFLARE_ACCOUNT_ID: string;
@@ -40,6 +50,24 @@ export interface ZipJob {
   createdBy?: string; // optional audit
   files?: Array<{ key: string; relativePath?: string }>; // file mappings for folder structure
 }
+
+export type ZipJobManifest = {
+  version: "v1";
+  jobId: string;
+  transferId: string;
+  outputKey: string;
+  createdAtMs: number;
+  includeEmpty: boolean;
+  files: Array<{
+    key: string;
+    nameInZip: string;
+    size: number;
+  }>;
+};
+
+export type ZipV2TickMessageData = {
+  jobId: string;
+};
 
 export interface StreamIngestJob {
   transferId: string;
@@ -77,6 +105,7 @@ export interface TransferUpdateRequest {
 
 export enum QueueMessageType {
   ZIP = "zip",
+  ZIP_V2_TICK = "zip_v2_tick",
   STREAM_INGEST = "stream_ingest",
 }
 
@@ -85,9 +114,14 @@ interface ZipMessage {
   data: ZipJob;
 }
 
+interface ZipV2TickMessage {
+  type: QueueMessageType.ZIP_V2_TICK;
+  data: ZipV2TickMessageData;
+}
+
 interface StreamIngestMessage {
   type: QueueMessageType.STREAM_INGEST;
   data: StreamIngestJob;
 }
 
-export type QueueMessage = ZipMessage | StreamIngestMessage;
+export type QueueMessage = ZipMessage | ZipV2TickMessage | StreamIngestMessage;

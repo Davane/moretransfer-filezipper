@@ -6,7 +6,7 @@ import {
   ZipJob,
 } from "../lib/types/types";
 import { WebAPIService } from "./web-api-service";
-import { calculateExponentialBackoff } from "../lib/utils";
+import { calculateExponentialBackoff, resolveNameInZip } from "../lib/utils";
 import { R2MultipartSink, Zip64StoreWriter } from "../lib/zip64";
 
 const DEFAULT_MAX_FILES = 500;
@@ -250,7 +250,7 @@ export class Zipper {
     }
 
     const key = obj.key;
-    const nameInZip = this.resolveNameInZip(key, currentObjectPrefix, filePathMap.get(key));
+    const nameInZip = resolveNameInZip(key, currentObjectPrefix, filePathMap.get(key));
 
     const r = await env.SOURCE_BUCKET.get(key);
     if (!r?.body) {
@@ -262,22 +262,22 @@ export class Zipper {
     await zip.addFile(nameInZip, r.body, obj.size);
   }
 
-  private resolveNameInZip(
-    key: string,
-    currentObjectPrefix: string,
-    relativePath: string | undefined,
-  ): string {
-    if (relativePath) {
-      return relativePath;
-    }
-    const delimiterIndex = key.indexOf("__");
-    const uploadedFileName =
-      delimiterIndex >= 0 ? key.slice(delimiterIndex + 2, key.length) : "";
-    return (
-      uploadedFileName ||
-      key.substring(currentObjectPrefix.length).replace(/^\/+/, "") ||
-      key.split("/").pop() ||
-      "file"
-    );
-  }
+  // private resolveNameInZip(
+  //   key: string,
+  //   currentObjectPrefix: string,
+  //   relativePath: string | undefined,
+  // ): string {
+  //   if (relativePath) {
+  //     return relativePath;
+  //   }
+  //   const delimiterIndex = key.indexOf("__");
+  //   const uploadedFileName =
+  //     delimiterIndex >= 0 ? key.slice(delimiterIndex + 2, key.length) : "";
+  //   return (
+  //     uploadedFileName ||
+  //     key.substring(currentObjectPrefix.length).replace(/^\/+/, "") ||
+  //     key.split("/").pop() ||
+  //     "file"
+  //   );
+  // }
 }
