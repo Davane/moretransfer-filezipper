@@ -187,9 +187,13 @@ export class JobManagerDO {
       `SELECT jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage FROM job_state WHERE jobId = ?;`,
       jobId,
     );
-    const row = rs.one?.() ?? null;
+    const rows = rs.toArray?.() ?? [];
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
 
-    return row as JobStateRow | null;
+    return row as JobStateRow;
   }
 
   private getCheckpoint(jobId: string): Checkpoint | null {
@@ -200,7 +204,8 @@ export class JobManagerDO {
       jobId,
     );
 
-    const row = rs.one?.() ?? null;
+    const rows = rs.toArray?.() ?? [];
+    const row = rows[0];
     if (!row) {
       return null;
     }
