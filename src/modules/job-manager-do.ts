@@ -6,6 +6,16 @@ type JobStatus = "PENDING" | "RUNNING" | "FINALIZING" | "DONE" | "FAILED" | "CAN
 
 type UploadedPart = { partNumber: number; etag: string; sizeBytes: number };
 
+type ErrorKind =
+  | "container_5xx"
+  | "container_429"
+  | "container_4xx"
+  | "container_timeout"
+  | "r2_eof"
+  | "r2_transient"
+  | "bad_manifest"
+  | "unknown";
+
 type ZipEntryRow = {
   jobId: string;
   fileIndex: number;
@@ -38,6 +48,12 @@ type JobStateRow = {
   createdAtMs: number;
   updatedAtMs: number;
   errorMessage?: string;
+  consecutiveFailures: number;
+  lastFailureAtMs?: number;
+  nextRetryAtMs?: number;
+  lastErrorKind?: ErrorKind;
+  cleanupAtMs?: number;
+  nextTickAtMs?: number;
 };
 
 type StartJobRequest = {
@@ -54,6 +70,7 @@ type TickJobRequest = {
 type TickJobResponse = {
   status: JobStatus;
   done: boolean;
+  retryAfterSeconds?: number;
 };
 
 type RunChunkResponse = {
@@ -69,6 +86,10 @@ type RunChunkResponse = {
 const DEFAULT_PART_SIZE = 128 * 1024 * 1024; // 128 MiB
 const ZIP_V2_VERSION = "zip64-store-container-v1";
 const DEFAULT_NUMBER_OF_PARTS = 8;
+const DEFAULT_MAX_CONSECUTIVE_FAILURES = 8;
+const DEFAULT_RETRY_BASE_DELAY_SECONDS = 10;
+const CLEANUP_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TICK_INTERVAL_MS = 5_000;
 
 function jsonResponse(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -98,11 +119,148 @@ function checkpointSummary(cp: Checkpoint) {
   };
 }
 
+async function clearAlarmIfSupported(storage: DurableObjectStorage) {
+  // deleteAlarm exists in newer runtime APIs; keep best-effort compatibility.
+  const anyStorage: any = storage as any;
+  if (typeof anyStorage.deleteAlarm === "function") {
+    await anyStorage.deleteAlarm();
+  }
+}
+
+function clampInt(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function jitterMs(maxJitterMs = 1000) {
+  return Math.floor(Math.random() * maxJitterMs);
+}
+
+function computeBackoffSeconds(consecutiveFailures: number, baseSeconds: number) {
+  // Exponential backoff with a reasonable cap.
+  const exp = Math.pow(2, clampInt(consecutiveFailures - 1, 0, 10));
+  return clampInt(Math.floor(baseSeconds * exp), baseSeconds, 10 * 60);
+}
+
+function classifyContainerFailure(
+  status: number,
+  errText: string,
+): { retryable: boolean; kind: ErrorKind } {
+  const s = errText.toLowerCase();
+  if (
+    s.includes("manifest fetch failed") ||
+    s.includes("entries fetch failed") ||
+    s.includes("bad json")
+  ) {
+    return { retryable: false, kind: "bad_manifest" };
+  }
+  if (s.includes("context deadline exceeded") || s.includes("timeout")) {
+    return { retryable: true, kind: "container_timeout" };
+  }
+  if (s.includes("eof") || s.includes("connection reset") || s.includes("broken pipe")) {
+    return { retryable: true, kind: "r2_eof" };
+  }
+  if (status === 429) return { retryable: true, kind: "container_429" };
+  if (status >= 500) return { retryable: true, kind: "container_5xx" };
+  if (status >= 400) return { retryable: false, kind: "container_4xx" };
+  return { retryable: true, kind: "unknown" };
+}
+
+class ContainerRunError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly errText: string,
+  ) {
+    super(`Container run failed: ${status} ${errText}`);
+    this.name = "ContainerRunError";
+  }
+}
+
 export class JobManagerDO {
   constructor(
     private readonly state: DurableObjectState,
     private readonly env: Env,
   ) {}
+
+  async alarm(): Promise<void> {
+    this.initIfNeeded();
+    const sql = this.sql();
+    const now = nowMs();
+
+    // --------------------------------------------------------------------------
+    // Cleanup: purge completed/failed job state after TTL
+    // --------------------------------------------------------------------------
+    const due = sql.exec(
+      `SELECT jobId, status, cleanupAtMs
+       FROM job_state
+       WHERE cleanupAtMs IS NOT NULL
+         AND cleanupAtMs <= ?
+         AND status IN ('DONE','FAILED');`,
+      now,
+    );
+
+    const dueRows = due.toArray?.() ?? [];
+    for (const row of dueRows) {
+      const r: any = row;
+      const jobId = String(r.jobId);
+      const status = String(r.status) as JobStatus;
+
+      try {
+        if (status === "FAILED") {
+          // Best-effort abort of multipart upload (if we have uploadId/outputKey)
+          const cp = this.getCheckpoint(jobId);
+          if (cp?.uploadId) {
+            try {
+              const up = this.env.OUTPUT_BUCKET.resumeMultipartUpload(cp.outputKey, cp.uploadId);
+              await up.abort();
+              console.log(`[zip-v2] Cleanup aborted multipart upload.`, {
+                jobId,
+                outputKey: cp.outputKey,
+                uploadId: `${cp.uploadId.slice(0, 8)}...`,
+              });
+            } catch (e) {
+              console.warn(`[zip-v2] Cleanup failed to abort multipart upload (best-effort).`, {
+                jobId,
+                error: String((e as any)?.message ?? e),
+              });
+            }
+          }
+        }
+
+        // Purge DO-local state
+        sql.exec(`DELETE FROM uploaded_parts WHERE jobId = ?;`, jobId);
+        sql.exec(`DELETE FROM zip_entries WHERE jobId = ?;`, jobId);
+        sql.exec(`DELETE FROM checkpoint WHERE jobId = ?;`, jobId);
+        sql.exec(`DELETE FROM job_state WHERE jobId = ?;`, jobId);
+
+        console.log(`[zip-v2] Cleanup purged job state.`, { jobId, status });
+      } catch (e) {
+        console.error(`[zip-v2] Cleanup failed.`, {
+          jobId,
+          status,
+          error: String((e as any)?.message ?? e),
+        });
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // Tick scheduling: enqueue due ZIP_V2_TICK messages
+    // --------------------------------------------------------------------------
+    const dueTicks = sql.exec(
+      `SELECT jobId
+       FROM job_state
+       WHERE cleanupAtMs IS NOT NULL;`,
+    );
+    const nextRow = (next.toArray?.() ?? [])[0] as any;
+    const nextCleanupAtMs = nextRow?.nextCleanupAtMs as number | null | undefined;
+
+    if (nextCleanupAtMs && Number.isFinite(nextCleanupAtMs)) {
+      await this.state.storage.setAlarm(nextCleanupAtMs);
+      console.log(`[zip-v2] Cleanup alarm scheduled.`, { nextCleanupAtMs });
+    } else {
+      await clearAlarmIfSupported(this.state.storage);
+      console.log(`[zip-v2] Cleanup alarm cleared (no pending cleanups).`);
+    }
+  }
 
   async fetch(req: Request): Promise<Response> {
     this.initIfNeeded();
@@ -193,6 +351,8 @@ export class JobManagerDO {
       status: "PENDING",
       createdAtMs: nowMs(),
       updatedAtMs: nowMs(),
+      consecutiveFailures: 0,
+      cleanupAtMs: undefined,
     } satisfies JobStateRow);
 
     this.upsertCheckpoint(jobId, {
@@ -222,6 +382,18 @@ export class JobManagerDO {
     const checkpoint = this.getCheckpoint(jobId);
     if (!job || !checkpoint) {
       throw new Error(`No Job or Checkpoint found for job: ${jobId}`);
+    }
+
+    if (job.nextRetryAtMs && nowMs() < job.nextRetryAtMs) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((job.nextRetryAtMs - nowMs()) / 1000));
+      console.log(`[zip-v2] Tick skipped (backoff).`, {
+        jobId,
+        transferId: job.transferId,
+        retryAfterSeconds,
+        consecutiveFailures: job.consecutiveFailures,
+        lastErrorKind: job.lastErrorKind,
+      });
+      return { status: job.status, done: false, retryAfterSeconds };
     }
 
     console.log(`[zip-v2] Tick start.`, {
@@ -355,7 +527,7 @@ export class JobManagerDO {
           manifestKey: checkpoint.manifestKey,
           checkpoint: checkpointSummary(checkpoint),
         });
-        throw new Error(`Container run failed: ${runResp.status} ${errText}`);
+        throw new ContainerRunError(runResp.status, errText);
       }
 
       const run = (await runResp.json()) satisfies RunChunkResponse;
@@ -373,6 +545,17 @@ export class JobManagerDO {
         filesDone: run.filesDone,
         done: run.done,
       });
+
+      if (job.consecutiveFailures > 0 || job.nextRetryAtMs || job.lastErrorKind) {
+        this.upsertJob({
+          ...job,
+          consecutiveFailures: 0,
+          nextRetryAtMs: undefined,
+          lastFailureAtMs: undefined,
+          lastErrorKind: undefined,
+          updatedAtMs: nowMs(),
+        });
+      }
 
       if (run.uploadedParts?.length) {
         this.insertUploadedParts(jobId, run.uploadedParts);
@@ -397,7 +580,14 @@ export class JobManagerDO {
           throw new Error("Container reported done but output does not exist");
         }
 
-        this.upsertJob({ ...job, status: "DONE", updatedAtMs: nowMs() });
+        const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
+        this.upsertJob({ ...job, status: "DONE", updatedAtMs: nowMs(), cleanupAtMs });
+        await this.state.storage.setAlarm(cleanupAtMs);
+        console.log(`[zip-v2] Cleanup scheduled (done).`, {
+          jobId,
+          transferId: job.transferId,
+          cleanupAtMs,
+        });
 
         // Best-effort status callback
         const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
@@ -435,8 +625,56 @@ export class JobManagerDO {
       });
       return { status: "RUNNING", done: false };
     } catch (err: any) {
+      const errMsg = String(err?.message ?? err);
+      const status = err instanceof ContainerRunError ? err.status : 500;
+      const rawErrText = err instanceof ContainerRunError ? err.errText : errMsg;
+      const { retryable, kind } = classifyContainerFailure(status, rawErrText);
+
+      const consecutiveFailures = (job.consecutiveFailures ?? 0) + 1;
+      const maxConsecutiveFailures = toInt(
+        (this.env as any).ZIP_V2_MAX_CONSECUTIVE_FAILURES,
+        DEFAULT_MAX_CONSECUTIVE_FAILURES,
+      );
+      const baseDelaySeconds = toInt(
+        (this.env as any).ZIP_V2_RETRY_BASE_DELAY_SECONDS,
+        DEFAULT_RETRY_BASE_DELAY_SECONDS,
+      );
+
+      if (retryable && consecutiveFailures < maxConsecutiveFailures) {
+        const backoffSeconds = computeBackoffSeconds(consecutiveFailures, baseDelaySeconds);
+        const nextRetryAtMs = nowMs() + backoffSeconds * 1000 + jitterMs(1000);
+        this.upsertJob({
+          ...job,
+          status: "RUNNING",
+          updatedAtMs: nowMs(),
+          errorMessage: rawErrText,
+          consecutiveFailures,
+          lastFailureAtMs: nowMs(),
+          nextRetryAtMs,
+          lastErrorKind: kind,
+        });
+
+        console.warn(`[zip-v2] Tick failed (retrying).`, {
+          jobId,
+          transferId: job.transferId,
+          consecutiveFailures,
+          maxConsecutiveFailures,
+          retryAfterSeconds: backoffSeconds,
+          errorKind: kind,
+          status,
+          error: rawErrText,
+        });
+
+        return { status: "RUNNING", done: false, retryAfterSeconds: backoffSeconds };
+      }
+
       console.error(`[zip-v2] job failed jobId=${jobId}`, {
         error: err,
+        errorMessage: errMsg,
+        errorKind: kind,
+        retryable,
+        consecutiveFailures,
+        maxConsecutiveFailures,
         jobId,
         transferId: job.transferId,
         bundleObjectKey: checkpoint.outputKey,
@@ -444,11 +682,24 @@ export class JobManagerDO {
         tickDurationMs: nowMs() - tickStartMs,
         checkpoint: checkpointSummary(checkpoint),
       });
+
+      const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
       this.upsertJob({
         ...job,
         status: "FAILED",
         updatedAtMs: nowMs(),
-        errorMessage: String(err?.message ?? err),
+        errorMessage: rawErrText,
+        consecutiveFailures,
+        lastFailureAtMs: nowMs(),
+        nextRetryAtMs: undefined,
+        lastErrorKind: kind,
+        cleanupAtMs,
+      });
+      await this.state.storage.setAlarm(cleanupAtMs);
+      console.log(`[zip-v2] Cleanup scheduled (failed).`, {
+        jobId,
+        transferId: job.transferId,
+        cleanupAtMs,
       });
 
       // Best-effort failure callback
@@ -521,9 +772,30 @@ export class JobManagerDO {
         status TEXT NOT NULL,
         createdAtMs INTEGER NOT NULL,
         updatedAtMs INTEGER NOT NULL,
-        errorMessage TEXT
+        errorMessage TEXT,
+        consecutiveFailures INTEGER NOT NULL DEFAULT 0,
+        lastFailureAtMs INTEGER,
+        nextRetryAtMs INTEGER,
+        lastErrorKind TEXT,
+        cleanupAtMs INTEGER
       );`,
     );
+
+    // Backward-compatible migrations for existing environments.
+    // (CREATE TABLE IF NOT EXISTS does not add columns.)
+    for (const stmt of [
+      `ALTER TABLE job_state ADD COLUMN consecutiveFailures INTEGER NOT NULL DEFAULT 0;`,
+      `ALTER TABLE job_state ADD COLUMN lastFailureAtMs INTEGER;`,
+      `ALTER TABLE job_state ADD COLUMN nextRetryAtMs INTEGER;`,
+      `ALTER TABLE job_state ADD COLUMN lastErrorKind TEXT;`,
+      `ALTER TABLE job_state ADD COLUMN cleanupAtMs INTEGER;`,
+    ]) {
+      try {
+        sql.exec(stmt);
+      } catch {
+        // ignore: column already exists
+      }
+    }
     sql.exec(
       `CREATE TABLE IF NOT EXISTS checkpoint (
         jobId TEXT PRIMARY KEY,
@@ -568,7 +840,9 @@ export class JobManagerDO {
   private getJobRow(jobId: string): JobStateRow | null {
     const sql = this.sql();
     const rs = sql.exec(
-      `SELECT jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage FROM job_state WHERE jobId = ?;`,
+      `SELECT jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage,
+              consecutiveFailures, lastFailureAtMs, nextRetryAtMs, lastErrorKind, cleanupAtMs
+       FROM job_state WHERE jobId = ?;`,
       jobId,
     );
     const rows = rs.toArray?.() ?? [];
@@ -577,7 +851,20 @@ export class JobManagerDO {
       return null;
     }
 
-    return row as JobStateRow;
+    const r: any = row;
+    return {
+      jobId: r.jobId,
+      transferId: r.transferId,
+      status: r.status,
+      createdAtMs: r.createdAtMs,
+      updatedAtMs: r.updatedAtMs,
+      errorMessage: r.errorMessage ?? undefined,
+      consecutiveFailures: r.consecutiveFailures ?? 0,
+      lastFailureAtMs: r.lastFailureAtMs ?? undefined,
+      nextRetryAtMs: r.nextRetryAtMs ?? undefined,
+      lastErrorKind: (r.lastErrorKind ?? undefined) as any,
+      cleanupAtMs: r.cleanupAtMs ?? undefined,
+    } satisfies JobStateRow;
   }
 
   private getCheckpoint(jobId: string): Checkpoint | null {
@@ -613,19 +900,32 @@ export class JobManagerDO {
   private upsertJob(row: JobStateRow) {
     const sql = this.sql();
     sql.exec(
-      `INSERT INTO job_state (jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO job_state (
+         jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage,
+         consecutiveFailures, lastFailureAtMs, nextRetryAtMs, lastErrorKind, cleanupAtMs
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(jobId) DO UPDATE SET
          transferId=excluded.transferId,
          status=excluded.status,
          updatedAtMs=excluded.updatedAtMs,
-         errorMessage=excluded.errorMessage;`,
+         errorMessage=excluded.errorMessage,
+         consecutiveFailures=excluded.consecutiveFailures,
+         lastFailureAtMs=excluded.lastFailureAtMs,
+         nextRetryAtMs=excluded.nextRetryAtMs,
+         lastErrorKind=excluded.lastErrorKind,
+         cleanupAtMs=excluded.cleanupAtMs;`,
       row.jobId,
       row.transferId,
       row.status,
       row.createdAtMs,
       row.updatedAtMs,
       row.errorMessage ?? null,
+      row.consecutiveFailures ?? 0,
+      row.lastFailureAtMs ?? null,
+      row.nextRetryAtMs ?? null,
+      row.lastErrorKind ?? null,
+      row.cleanupAtMs ?? null,
     );
   }
 

@@ -10,13 +10,16 @@ function json(obj: unknown, status = 200, headers: Record<string, string> = {}) 
   });
 }
 
-
 export class ZipContainerDO extends Container {
   defaultPort = 8080;
-  sleepAfter = "30s";
   enableInternet = false;
 
-  // Allow only our virtual hosts. These are evaluated before outbound handlers.
+  // Reduce churn between ticks/chunks. Alarms 
+  // still stop idle containers eventually.
+  sleepAfter = "2m";
+
+  // Allow only our virtual hosts. These are 
+  // evaluated before outbound handlers.
   allowedHosts = ["source.r2", "output.r2", "job.do"];
 }
 
@@ -133,7 +136,7 @@ ZipContainerDO.outboundByHost = {
     if (request.method === "POST" && url.pathname === "/abort") {
       const key = url.searchParams.get("key");
       const uploadId = url.searchParams.get("uploadId");
-    
+
       if (!key || !uploadId) {
         return json({ error: "missing key/uploadId" }, 400);
       }

@@ -72,8 +72,23 @@ export default {
           await env.QUEUE_WORKER_MAIN.send(message);
           console.log("Job queued", JSON.stringify(message));
         } else {
-          const jobId = crypto.randomUUID();
+          // Stable ID so repeated triggers resume the same JobManagerDO state.
+          // One ZIP v2 job per transfer.
+          const jobId = job.transferId;
           const outputKey = resolveOutputKey(env, job);
+
+          // Idempotent start: if the output already exists, do not restart work.
+          const existingOut = await env.OUTPUT_BUCKET.head(outputKey);
+          if (existingOut) {
+            console.log(`[zip-v2] Output already exists; skipping start.`, {
+              jobId,
+              transferId: job.transferId,
+              outputKey,
+              outputBytes: existingOut.size,
+            });
+            return new Response("Enqueued", { status: 202 });
+          }
+
           const { manifestKey } = await writeZipManifest({
             env,
             jobId,
@@ -184,13 +199,15 @@ export default {
             method: "POST",
             body: JSON.stringify({ jobId }),
           });
-          const result = (await resp.json()) as { done: boolean; status: string };
-          if (result.done) {
-            msg.ack();
-          } else {
-            // Requeue via retry with a small delay to avoid tight loops.
-            msg.retry({ delaySeconds: 15 });
+
+          if (!resp.ok) {
+            throw new Error(`JobManager tick failed: ${resp.status} ${await resp.text()}`);
           }
+
+          // Always ack on normal progress. JobManagerDO will schedule the next tick via alarm.
+          // Only use queue retry for real failures/exceptions.
+          await resp.json().catch(() => {});
+          msg.ack();
         } catch (e) {
           console.error("[zip-v2] tick failed:", e);
           msg.retry({ delaySeconds: 30 });
