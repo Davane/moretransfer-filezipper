@@ -14,10 +14,9 @@ import { StreamIngestor } from "./modules/stream-ingestor";
 import { resolveOutputKey, writeZipManifest, toBool } from "./modules/job-manifest";
 import { JobManagerDO } from "./modules/job-manager-do";
 import { ZipSemaphoreDO } from "./modules/semaphore-do";
-import { ZipContainerDO, ContainerProxy } from "./modules/zip-container";
+import { ZipContainerDO } from "./modules/zip-container";
 
-// export type { Env } from "./lib/types/types"
-export { ContainerProxy };
+export { ContainerProxy } from "@cloudflare/containers";
 
 export default {
   /**

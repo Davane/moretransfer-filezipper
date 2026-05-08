@@ -1,6 +1,6 @@
 name = "moretransfer-worker"
 main = "src/index.ts"
-compatibility_date = "2025-08-15"
+compatibility_date = "2026-05-08"
 workers_dev = true
 
 # -----------------------------
