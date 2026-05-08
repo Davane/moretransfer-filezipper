@@ -81,6 +81,7 @@ export default {
             outputKey,
           });
 
+          // Start a new zip v2 job by forwarding to JobManagerDO
           const jobManagerId = env.JobManager.idFromName(jobId);
           const jobManager = env.JobManager.get(jobManagerId);
           await jobManager.fetch("https://job/start", {
@@ -93,8 +94,12 @@ export default {
             }),
           });
 
+          // Enqueue a tick message to the queue to start the zip v2 job
           const tick: ZipV2TickMessageData = { jobId };
-          const message: QueueMessage = { type: QueueMessageType.ZIP_V2_TICK, data: tick };
+          const message: QueueMessage = { 
+            type: QueueMessageType.ZIP_V2_TICK, 
+            data: tick 
+          };
           console.log("Sending zip v2 tick to queue:", JSON.stringify(message));
           
           await env.QUEUE_WORKER_MAIN.send(message);
@@ -169,7 +174,10 @@ export default {
         await new Zipper(env).zip(msg, webAPIService);
       } else if (msg.body.type === QueueMessageType.ZIP_V2_TICK) {
         const { jobId } = msg.body.data;
+
         try {
+
+          // Handle the zip v2 tick message by forwarding to JobManagerDO
           const id = env.JobManager.idFromName(jobId);
           const stub = env.JobManager.get(id);
           const resp = await stub.fetch("https://job/tick", {

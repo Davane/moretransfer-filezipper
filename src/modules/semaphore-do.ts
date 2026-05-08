@@ -40,7 +40,7 @@ export class ZipSemaphoreDO {
         limit,
       );
       const rs = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
-      const row = rs.one?.() as any;
+      const row = rs.one?.();
       const inUse = Number(row?.inUse ?? 0);
 
       // If we exceeded limit, roll back and deny (rare race; safe).
@@ -60,17 +60,17 @@ export class ZipSemaphoreDO {
       const sql = this.sql();
       sql.exec(`UPDATE tokens SET inUse = CASE WHEN inUse > 0 THEN inUse - 1 ELSE 0 END WHERE id = 1;`);
       const rs = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
-      const row = rs.one?.() as any;
+      const row = rs.one?.();
 
       return jsonResponse({ released: true, inUse: Number(row?.inUse ?? 0) });
     }
 
-    if (req.method === "GET" && url.pathname === "/status") {
-      const rs = this.sql().exec(`SELECT inUse FROM tokens WHERE id = 1;`);
-      const row = rs.one?.() as any;
+    // if (req.method === "GET" && url.pathname === "/status") {
+    //   const rs = this.sql().exec(`SELECT inUse FROM tokens WHERE id = 1;`);
+    //   const row = rs.one?.();
 
-      return jsonResponse({ inUse: Number(row?.inUse ?? 0) });
-    }
+    //   return jsonResponse({ inUse: Number(row?.inUse ?? 0) });
+    // }
 
     return new Response("not found", { status: 404 });
   }

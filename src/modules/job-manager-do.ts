@@ -40,6 +40,36 @@ type JobStateRow = {
   errorMessage?: string;
 };
 
+type StartJobRequest = {
+  jobId: string;
+  transferId: string;
+  manifestKey: string;
+  outputKey: string;
+};
+
+type TickJobRequest = {
+  jobId: string;
+};
+
+type TickJobResponse = {
+  status: JobStatus;
+  done: boolean;
+};
+
+type RunChunkResponse = {
+  uploadedParts: UploadedPart[];
+  nextPartNumber: number;
+  fileIndex: number;
+  zipOffset: string;
+  bytesWrittenTotal: string;
+  filesDone: number;
+  done: boolean;
+};
+
+const DEFAULT_PART_SIZE = 128 * 1024 * 1024; // 128 MiB
+const ZIP_V2_VERSION = "zip64-store-container-v1";
+const DEFAULT_NUMBER_OF_PARTS = 8;
+
 function jsonResponse(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
@@ -59,6 +89,354 @@ export class JobManagerDO {
     private readonly env: Env,
   ) {}
 
+  async fetch(req: Request): Promise<Response> {
+    this.initIfNeeded();
+    const url = new URL(req.url);
+
+    // Start the zip v2 job
+    if (req.method === "POST" && url.pathname === "/start") {
+      const body = await req.json();
+      await this.handleStart(body as StartJobRequest);
+
+      return jsonResponse({ ok: true });
+    }
+
+    // Handle tick requests
+    if (req.method === "POST" && url.pathname === "/tick") {
+      const body = await req.json();
+      const jobId = (body as TickJobRequest).jobId;
+
+      const result = await this.handleTick(jobId);
+
+      return jsonResponse(result);
+    }
+
+    // Handle status requests to get the job status
+    // if (req.method === "GET" && url.pathname === "/status") {
+    //   const jobId = url.searchParams.get("jobId");
+    //   if (!jobId) {
+    //     return jsonResponse({ error: "missing jobId" }, 400);
+    //   }
+
+    //   const status = await this.getJobStatus(jobId);
+
+    //   return jsonResponse(status);
+    // }
+
+    // Handle list entries requests
+    if (url.pathname === "/entries" && req.method === "GET") {
+      const jobId = url.searchParams.get("jobId");
+      if (!jobId) {
+        return jsonResponse({ error: "missing jobId" }, 400);
+      }
+
+      const entries = this.listZipEntries(jobId);
+
+      return jsonResponse(entries);
+    }
+
+    // Handle upsert entry requests
+    if (url.pathname === "/entries" && req.method === "POST") {
+      const jobId = url.searchParams.get("jobId");
+      const fileIndex = url.searchParams.get("fileIndex");
+      if (!jobId || fileIndex === null) {
+        return jsonResponse({ error: "missing jobId/fileIndex" }, 400);
+      }
+
+      const entry = (await req.json()) as Omit<ZipEntryRow, "jobId" | "fileIndex">;
+      this.upsertZipEntry(jobId, Number(fileIndex), entry);
+
+      return jsonResponse({ ok: true });
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+
+  // --------------------------------------------------------------------------------
+  // Handlers
+  // --------------------------------------------------------------------------------
+
+  private async handleStart(body: StartJobRequest) {
+    const { jobId, transferId, manifestKey, outputKey } = body;
+
+    const existing = this.getJobRow(jobId);
+    if (existing) {
+      console.log(`[zip-v2] Job already exists.`, {
+        jobId,
+        transferId,
+        manifestKey,
+        outputKey,
+      });
+      return;
+    }
+
+    const partSize = toInt(this.env.ZIP_PART_SIZE_BYTES, DEFAULT_PART_SIZE);
+
+    this.upsertJob({
+      jobId,
+      transferId,
+      status: "PENDING",
+      createdAtMs: nowMs(),
+      updatedAtMs: nowMs(),
+    } satisfies JobStateRow);
+
+    this.upsertCheckpoint(jobId, {
+      manifestKey,
+      outputKey,
+      uploadId: undefined,
+      partSize,
+      nextPartNumber: 1,
+      fileIndex: 0,
+      zipOffset: "0",
+      bytesWrittenTotal: "0",
+      filesDone: 0,
+      done: false,
+    });
+
+    console.log(`[zip-v2] Job started.`, {
+      jobId,
+      transferId,
+      manifestKey,
+      outputKey,
+    });
+  }
+
+  private async handleTick(jobId: string): Promise<TickJobResponse> {
+    const job = this.getJobRow(jobId);
+    const checkpoint = this.getCheckpoint(jobId);
+    if (!job || !checkpoint) {
+      throw new Error(`No Job or Checkpoint found for job: ${jobId}`);
+    }
+
+    if (job.status === "DONE" || job.status === "FAILED" || job.status === "CANCELLED") {
+      console.log(`[zip-v2] Job already completed.`, {
+        jobId,
+        jobStatus: job.status,
+      });
+      return {
+        status: job.status,
+        done: job.status === "DONE",
+      };
+    }
+
+    const useContainers = toBool(this.env.ZIP_USE_CONTAINERS, false);
+    if (!useContainers) {
+      throw new Error("ZIP v2 tick received but ZIP_USE_CONTAINERS is disabled");
+    }
+
+    const existingOut = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
+    if (existingOut) {
+      this.upsertJob({
+        ...job,
+        status: "DONE",
+        updatedAtMs: nowMs(),
+      });
+
+      return { status: "DONE", done: true };
+    }
+
+    // Acquire the semaphore to prevent multiple jobs from running concurrently
+    const semaphoreId = this.env.ZipSemaphore.idFromName("global");
+    const semaphore = this.env.ZipSemaphore.get(semaphoreId);
+    const desired = toInt(this.env.ZIP_GLOBAL_CONCURRENCY, 1);
+
+    const acquiredResp = await semaphore.fetch("https://semaphore/acquire", {
+      method: "POST",
+      body: JSON.stringify({ jobId, limit: desired }),
+    });
+
+    if (!acquiredResp.ok) {
+      const errText = await acquiredResp.text();
+      console.error(`[zip-v2] Failed to acquire semaphore.`, {
+        error: errText,
+        status: acquiredResp.status,
+        jobId,
+        transferId: job.transferId,
+        bundleObjectKey: checkpoint.outputKey,
+        manifestKey: checkpoint.manifestKey,
+      });
+
+      // No token; caller should retry later.
+      return {
+        status: job.status,
+        done: false,
+      };
+    }
+
+    try {
+      this.upsertJob({
+        ...job,
+        status: "RUNNING",
+        updatedAtMs: nowMs(),
+      });
+
+      // Create a new multipart upload if it doesn't exist
+      const maxParts = toInt(this.env.ZIP_MAX_PARTS_PER_TICK, DEFAULT_NUMBER_OF_PARTS);
+      if (!checkpoint.uploadId) {
+        const upload = await this.env.OUTPUT_BUCKET.createMultipartUpload(checkpoint.outputKey, {
+          customMetadata: {
+            jobId,
+            transferId: job.transferId,
+            manifestKey: checkpoint.manifestKey,
+            zipVersion: ZIP_V2_VERSION,
+          },
+        });
+        checkpoint.uploadId = upload.uploadId;
+        this.upsertCheckpoint(jobId, checkpoint);
+      }
+
+      // Run the container to upload the next parts
+      const containerId = this.env.ZipContainer.idFromName(jobId);
+      const containerStub = this.env.ZipContainer.get(containerId);
+
+      // Forward the request to the container
+      const runResp = await containerStub.fetch("https://zip/runChunk", {
+        method: "POST",
+        body: JSON.stringify({
+          jobId,
+          manifestKey: checkpoint.manifestKey,
+          outputKey: checkpoint.outputKey,
+          uploadId: checkpoint.uploadId,
+          partSize: checkpoint.partSize,
+          nextPartNumber: checkpoint.nextPartNumber,
+          fileIndex: checkpoint.fileIndex,
+          zipOffset: checkpoint.zipOffset,
+          maxParts,
+        }),
+      });
+
+      if (!runResp.ok) {
+        const errText = await runResp.text();
+        console.error(`[zip-v2] Container run failed.`, {
+          status: runResp.status,
+          error: errText,
+          jobId,
+          transferId: job.transferId,
+          bundleObjectKey: checkpoint.outputKey,
+          manifestKey: checkpoint.manifestKey,
+        });
+        throw new Error(`Container run failed: ${runResp.status} ${errText}`);
+      }
+
+      const run = (await runResp.json()) satisfies RunChunkResponse;
+
+      if (run.uploadedParts?.length) {
+        this.insertUploadedParts(jobId, run.uploadedParts);
+      }
+
+      this.upsertCheckpoint(jobId, {
+        ...checkpoint,
+        nextPartNumber: run.nextPartNumber,
+        fileIndex: run.fileIndex,
+        zipOffset: run.zipOffset,
+        bytesWrittenTotal: run.bytesWrittenTotal,
+        filesDone: run.filesDone,
+        done: run.done,
+      } satisfies Checkpoint);
+
+      if (run.done) {
+        // Container should have completed multipart; verify output exists and update status.
+        const out = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
+        if (!out) {
+          throw new Error("Container reported done but output does not exist");
+        }
+
+        this.upsertJob({ ...job, status: "DONE", updatedAtMs: nowMs() });
+
+        // Best-effort status callback
+        const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
+        await webAPIService
+          .updateTransferStatus(job.transferId, {
+            status: TransferStatus.READY,
+            bundleObjectKey: checkpoint.outputKey,
+          })
+          .catch((e) =>
+            console.warn(`[zip-v2] Failed to update transfer status`, {
+              error: e,
+              jobId,
+              transferId: job.transferId,
+              bundleObjectKey: checkpoint.outputKey,
+              manifestKey: checkpoint.manifestKey,
+            }),
+          );
+
+        return { status: "DONE", done: true };
+      }
+
+      // Not done; caller should enqueue another tick.
+      return { status: "RUNNING", done: false };
+    } catch (err: any) {
+      console.error(`[zip-v2] job failed jobId=${jobId}`, {
+        error: err,
+        jobId,
+        transferId: job.transferId,
+        bundleObjectKey: checkpoint.outputKey,
+        manifestKey: checkpoint.manifestKey,
+      });
+      this.upsertJob({
+        ...job,
+        status: "FAILED",
+        updatedAtMs: nowMs(),
+        errorMessage: String(err?.message ?? err),
+      });
+
+      // Best-effort failure callback
+      const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
+      await webAPIService
+        .updateTransferStatus(job.transferId, {
+          status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+        })
+        .catch((e) =>
+          console.warn(`[zip-v2] Failed to update transfer status`, {
+            error: e,
+            jobId,
+            transferId: job.transferId,
+            bundleObjectKey: checkpoint.outputKey,
+            manifestKey: checkpoint.manifestKey,
+          }),
+        );
+
+      return { status: "FAILED", done: false };
+    } finally {
+      const semaphoreId = this.env.ZipSemaphore.idFromName("global");
+      await this.env.ZipSemaphore.get(semaphoreId).fetch("https://semaphore/release", {
+        method: "POST",
+        body: JSON.stringify({ jobId }),
+      });
+    }
+  }
+
+  // Used by the web API to get the job status
+  // private async getJobStatus(jobId: string) {
+  //   const job = this.getJobRow(jobId);
+  //   const checkpoint = this.getCheckpoint(jobId);
+
+  //   if (!job || !checkpoint) {
+  //     return { jobId, exists: false };
+  //   }
+
+  //   return {
+  //     jobId,
+  //     transferId: job.transferId,
+  //     status: job.status,
+  //     errorMessage: job.errorMessage ?? null,
+  //     manifestKey: checkpoint.manifestKey,
+  //     outputKey: checkpoint.outputKey,
+  //     uploadId: checkpoint.uploadId ?? null,
+  //     partSize: checkpoint.partSize,
+  //     nextPartNumber: checkpoint.nextPartNumber,
+  //     fileIndex: checkpoint.fileIndex,
+  //     zipOffset: checkpoint.zipOffset,
+  //     bytesWrittenTotal: checkpoint.bytesWrittenTotal,
+  //     filesDone: checkpoint.filesDone,
+  //     done: checkpoint.done,
+  //     updatedAtMs: job.updatedAtMs,
+  //   };
+  // }
+
+  // --------------------------------------------------------------------------------
+  // SQL helpers
+  // --------------------------------------------------------------------------------
   private sql() {
     return this.state.storage.sql as any;
   }
@@ -114,71 +492,6 @@ export class JobManagerDO {
         PRIMARY KEY (jobId, fileIndex)
       );`,
     );
-  }
-
-  async fetch(req: Request): Promise<Response> {
-    this.initIfNeeded();
-    const url = new URL(req.url);
-
-    if (req.method === "POST" && url.pathname === "/start") {
-      const body = (await req.json()) as {
-        jobId: string;
-        transferId: string;
-        manifestKey: string;
-        outputKey: string;
-      };
-
-      await this.handleStart(body);
-
-      return jsonResponse({ ok: true });
-    }
-
-    // Handle tick requests
-    if (req.method === "POST" && url.pathname === "/tick") {
-      const body = (await req.json()) as { jobId: string };
-      const result = await this.handleTick(body.jobId);
-
-      return jsonResponse(result);
-    }
-
-    // Handle status requests
-    if (req.method === "GET" && url.pathname === "/status") {
-      const jobId = url.searchParams.get("jobId");
-      if (!jobId) {
-        return jsonResponse({ error: "missing jobId" }, 400);
-      }
-
-      const status = await this.getStatus(jobId);
-
-      return jsonResponse(status);
-    }
-
-    // Handle list entries requests
-    if (url.pathname === "/entries" && req.method === "GET") {
-      const jobId = url.searchParams.get("jobId");
-      if (!jobId) {
-        return jsonResponse({ error: "missing jobId" }, 400);
-      }
-
-      const entries = this.listZipEntries(jobId);
-
-      return jsonResponse(entries);
-    }
-
-    // Handle upsert entry requests
-    if (url.pathname === "/entries" && req.method === "POST") {
-      const jobId = url.searchParams.get("jobId");
-      const fileIndex = url.searchParams.get("fileIndex");
-      if (!jobId || fileIndex === null) {
-        return jsonResponse({ error: "missing jobId/fileIndex" }, 400);
-      }
-
-      const entry = (await req.json()) as Omit<ZipEntryRow, "jobId" | "fileIndex">;
-      this.upsertZipEntry(jobId, Number(fileIndex), entry);
-
-      return jsonResponse({ ok: true });
-    }
-    return new Response("not found", { status: 404 });
   }
 
   private getJobRow(jobId: string): JobStateRow | null {
@@ -291,16 +604,6 @@ export class JobManagerDO {
     }
   }
 
-  private listUploadedParts(jobId: string): UploadedPart[] {
-    const sql = this.sql();
-    const rs = sql.exec(
-      `SELECT partNumber, etag, sizeBytes FROM uploaded_parts WHERE jobId = ? ORDER BY partNumber ASC;`,
-      jobId,
-    );
-    const rows = rs.toArray?.() ?? [];
-    return rows as UploadedPart[];
-  }
-
   private upsertZipEntry(
     jobId: string,
     fileIndex: number,
@@ -340,285 +643,5 @@ export class JobManagerDO {
     );
     const rows = rs.toArray?.() ?? [];
     return rows as Array<Omit<ZipEntryRow, "jobId">>;
-  }
-
-  // private async readManifest(manifestKey: string): Promise<ZipJobManifest> {
-  //   const obj = await this.env.OUTPUT_BUCKET.get(manifestKey);
-  //   if (!obj?.body) {
-  //     throw new Error(`Missing manifest: ${manifestKey}`);
-  //   }
-  //   const text = await obj.text();
-  //   return JSON.parse(text) as ZipJobManifest;
-  // }
-
-  private async handleStart(body: {
-    jobId: string;
-    transferId: string;
-    manifestKey: string;
-    outputKey: string;
-  }) {
-    const { jobId, transferId, manifestKey, outputKey } = body;
-
-    const existing = this.getJobRow(jobId);
-    if (existing) {
-      console.log(`[zip-v2] Job already exists.`, {
-        jobId,
-        transferId,
-        manifestKey,
-        outputKey,
-      });
-      return;
-    }
-
-    const defaultPartSize = 128 * 1024 * 1024; // 128 MiB
-    const partSize = toInt(this.env.ZIP_PART_SIZE_BYTES, defaultPartSize);
-
-    this.upsertJob({
-      jobId,
-      transferId,
-      status: "PENDING",
-      createdAtMs: nowMs(),
-      updatedAtMs: nowMs(),
-    } satisfies JobStateRow);
-
-    this.upsertCheckpoint(jobId, {
-      manifestKey,
-      outputKey,
-      uploadId: undefined,
-      partSize,
-      nextPartNumber: 1,
-      fileIndex: 0,
-      zipOffset: "0",
-      bytesWrittenTotal: "0",
-      filesDone: 0,
-      done: false,
-    });
-
-    console.log(`[zip-v2] Job started.`, {
-      jobId,
-      transferId,
-      manifestKey,
-      outputKey,
-    });
-  }
-
-  private async handleTick(jobId: string): Promise<{ status: JobStatus; done: boolean }> {
-    const job = this.getJobRow(jobId);
-    const checkpoint = this.getCheckpoint(jobId);
-    if (!job || !checkpoint) {
-      throw new Error(`Unknown job: ${jobId}`);
-    }
-
-    if (job.status === "DONE" || job.status === "FAILED" || job.status === "CANCELLED") {
-      return { status: job.status, done: job.status === "DONE" };
-    }
-
-    const useContainers = toBool(this.env.ZIP_USE_CONTAINERS, false);
-    if (!useContainers) {
-      throw new Error("ZIP v2 tick received but ZIP_USE_CONTAINERS is disabled");
-    }
-
-    const existingOut = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
-    if (existingOut) {
-      this.upsertJob({
-        ...job,
-        status: "DONE",
-        updatedAtMs: nowMs(),
-      });
-
-      return { status: "DONE", done: true };
-    }
-
-    const semaphoreId = this.env.ZipSemaphore.idFromName("global");
-    const semaphore = this.env.ZipSemaphore.get(semaphoreId);
-    const desired = toInt(this.env.ZIP_GLOBAL_CONCURRENCY, 1);
-    const acquiredResp = await semaphore.fetch("https://semaphore/acquire", {
-      method: "POST",
-      body: JSON.stringify({ jobId, limit: desired }),
-    });
-
-    if (!acquiredResp.ok) {
-      const errText = await acquiredResp.text();
-      console.error(`[zip-v2] Failed to acquire semaphore.`, {
-        error: errText,
-        status: acquiredResp.status,
-        jobId,
-        transferId: job.transferId,
-        bundleObjectKey: checkpoint.outputKey,
-        manifestKey: checkpoint.manifestKey,
-      });
-      // No token; caller should retry later.
-      return { status: job.status, done: false };
-    }
-
-    try {
-      this.upsertJob({ ...job, status: "RUNNING", updatedAtMs: nowMs() });
-
-      const maxParts = toInt(this.env.ZIP_MAX_PARTS_PER_TICK, 8);
-      if (!checkpoint.uploadId) {
-        const upload = await this.env.OUTPUT_BUCKET.createMultipartUpload(checkpoint.outputKey, {
-          customMetadata: {
-            jobId,
-            transferId: job.transferId,
-            manifestKey: checkpoint.manifestKey,
-            zipVersion: "zip64-store-container-v1",
-          },
-        });
-        checkpoint.uploadId = upload.uploadId;
-        this.upsertCheckpoint(jobId, checkpoint);
-      }
-
-      const containerId = this.env.ZipContainer.idFromName(jobId);
-      const containerStub = this.env.ZipContainer.get(containerId);
-
-      const runResp = await containerStub.fetch("https://zip/runChunk", {
-        method: "POST",
-        body: JSON.stringify({
-          jobId,
-          manifestKey: checkpoint.manifestKey,
-          outputKey: checkpoint.outputKey,
-          uploadId: checkpoint.uploadId,
-          partSize: checkpoint.partSize,
-          nextPartNumber: checkpoint.nextPartNumber,
-          fileIndex: checkpoint.fileIndex,
-          zipOffset: checkpoint.zipOffset,
-          maxParts,
-        }),
-      });
-      if (!runResp.ok) {
-        const errText = await runResp.text();
-        console.error(`[zip-v2] Container run failed.`, {
-          status: runResp.status,
-          error: errText,
-          jobId,
-          transferId: job.transferId,
-          bundleObjectKey: checkpoint.outputKey,
-          manifestKey: checkpoint.manifestKey,
-        });
-        throw new Error(`Container run failed: ${runResp.status} ${errText}`);
-      }
-
-      const run = (await runResp.json()) as {
-        uploadedParts: UploadedPart[];
-        nextPartNumber: number;
-        fileIndex: number;
-        zipOffset: string;
-        bytesWrittenTotal: string;
-        filesDone: number;
-        done: boolean;
-      };
-
-      if (run.uploadedParts?.length) {
-        this.insertUploadedParts(jobId, run.uploadedParts);
-      }
-
-      const updated: Checkpoint = {
-        ...checkpoint,
-        nextPartNumber: run.nextPartNumber,
-        fileIndex: run.fileIndex,
-        zipOffset: run.zipOffset,
-        bytesWrittenTotal: run.bytesWrittenTotal,
-        filesDone: run.filesDone,
-        done: run.done,
-      };
-      this.upsertCheckpoint(jobId, updated);
-
-      if (run.done) {
-        // Container should have completed multipart; verify output exists and update status.
-        const out = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
-        if (!out) {
-          throw new Error("Container reported done but output does not exist");
-        }
-
-        this.upsertJob({ ...job, status: "DONE", updatedAtMs: nowMs() });
-
-        // Best-effort status callback
-        const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
-        await webAPIService
-          .updateTransferStatus(job.transferId, {
-            status: TransferStatus.READY,
-            bundleObjectKey: checkpoint.outputKey,
-          })
-          .catch((e) =>
-            console.warn(`[zip-v2] Failed to update transfer status`, {
-              error: e,
-              jobId,
-              transferId: job.transferId,
-              bundleObjectKey: checkpoint.outputKey,
-              manifestKey: checkpoint.manifestKey,
-            }),
-          );
-
-        return { status: "DONE", done: true };
-      }
-
-      // Not done; caller should enqueue another tick.
-      return { status: "RUNNING", done: false };
-    } catch (err: any) {
-      console.error(`[zip-v2] job failed jobId=${jobId}`, {
-        error: err,
-        jobId,
-        transferId: job.transferId,
-        bundleObjectKey: checkpoint.outputKey,
-        manifestKey: checkpoint.manifestKey,
-      });
-      this.upsertJob({
-        ...job,
-        status: "FAILED",
-        updatedAtMs: nowMs(),
-        errorMessage: String(err?.message ?? err),
-      });
-
-      // Best-effort failure callback
-      const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
-      await webAPIService
-        .updateTransferStatus(job.transferId, {
-          status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
-        })
-        .catch((e) =>
-          console.warn(`[zip-v2] Failed to update transfer status`, {
-            error: e,
-            jobId,
-            transferId: job.transferId,
-            bundleObjectKey: checkpoint.outputKey,
-            manifestKey: checkpoint.manifestKey,
-          }),
-        );
-
-      return { status: "FAILED", done: false };
-    } finally {
-      const semaphoreId = this.env.ZipSemaphore.idFromName("global");
-      await this.env.ZipSemaphore.get(semaphoreId).fetch("https://semaphore/release", {
-        method: "POST",
-        body: JSON.stringify({ jobId }),
-      });
-    }
-  }
-
-  private async getStatus(jobId: string) {
-    const job = this.getJobRow(jobId);
-    const checkpoint = this.getCheckpoint(jobId);
-
-    if (!job || !checkpoint) {
-      return { jobId, exists: false };
-    }
-
-    return {
-      jobId,
-      transferId: job.transferId,
-      status: job.status,
-      errorMessage: job.errorMessage ?? null,
-      manifestKey: checkpoint.manifestKey,
-      outputKey: checkpoint.outputKey,
-      uploadId: checkpoint.uploadId ?? null,
-      partSize: checkpoint.partSize,
-      nextPartNumber: checkpoint.nextPartNumber,
-      fileIndex: checkpoint.fileIndex,
-      zipOffset: checkpoint.zipOffset,
-      bytesWrittenTotal: checkpoint.bytesWrittenTotal,
-      filesDone: checkpoint.filesDone,
-      done: checkpoint.done,
-      updatedAtMs: job.updatedAtMs,
-    };
   }
 }

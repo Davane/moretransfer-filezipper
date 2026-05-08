@@ -110,6 +110,11 @@ type Manifest struct {
 	} `json:"files"`
 }
 
+
+// --------------------------------------------------------------------------------
+// Main
+// --------------------------------------------------------------------------------
+// Setup the HTTP server to handle the /runChunk endpoint from the JobManagerDO
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/runChunk", handleRunChunk)

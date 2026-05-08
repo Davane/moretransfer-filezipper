@@ -1,7 +1,7 @@
-import { Container, ContainerProxy } from "@cloudflare/containers";
+import { Container } from "@cloudflare/containers";
 import { Env } from "../lib/types/types";
 
-export { ContainerProxy };
+export { ContainerProxy } from "@cloudflare/containers";
 
 function json(obj: unknown, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(obj), {
@@ -10,10 +10,6 @@ function json(obj: unknown, status = 200, headers: Record<string, string> = {}) 
   });
 }
 
-async function readRequestBodyBytes(request: Request): Promise<Uint8Array> {
-  const ab = await request.arrayBuffer();
-  return new Uint8Array(ab);
-}
 
 export class ZipContainerDO extends Container {
   defaultPort = 8080;
@@ -82,19 +78,37 @@ ZipContainerDO.outboundByHost = {
       const key = url.searchParams.get("key");
       const uploadId = url.searchParams.get("uploadId");
       const partNumber = Number(url.searchParams.get("partNumber"));
+
       if (!key || !uploadId || !Number.isFinite(partNumber) || partNumber <= 0) {
         return json({ error: "missing key/uploadId/partNumber" }, 400);
       }
-      
-      const bytes = await readRequestBodyBytes(request);
-      const up = env.OUTPUT_BUCKET.resumeMultipartUpload(key, uploadId);
-      const uploaded = await up.uploadPart(partNumber, bytes);
+
+      // IMPORTANT: stream the request body to avoid buffering large (e.g. 128MiB) parts in memory.
+      const body = request.body;
+      if (!body) {
+        return json({ error: "missing request body" }, 400);
+      }
+
+      const contentLength = request.headers.get("content-length");
+      const contentLengthNum = contentLength ? Number(contentLength) : Number.NaN;
+      if (!Number.isFinite(contentLengthNum) || contentLengthNum <= 0) {
+        return json({ error: "missing or invalid content-length" }, 411);
+      }
+
+      // R2 multipart upload requires a readable stream with a known length.
+      // FixedLengthStream tags the readable side with a known length.
+      const fls = new FixedLengthStream(contentLengthNum);
+      const pump = body.pipeTo(fls.writable);
+
+      const destinationBucket = env.OUTPUT_BUCKET.resumeMultipartUpload(key, uploadId);
+      const uploaded = await destinationBucket.uploadPart(partNumber, fls.readable);
+      await pump;
 
       return new Response(null, {
         status: 200,
         headers: {
           "x-etag": uploaded.etag,
-          "x-size-bytes": String(bytes.byteLength),
+          "x-size-bytes": String(contentLengthNum),
         },
       });
     }
