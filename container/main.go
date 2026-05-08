@@ -138,6 +138,7 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
 	var req RunChunkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
@@ -150,6 +151,9 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 	if req.MaxParts <= 0 {
 		req.MaxParts = 8
 	}
+
+	log.Printf("[runChunk] start jobId=%s startTimeMs=%d fileIndex=%d nextPart=%d maxParts=%d partSize=%d zipOffset=%s outputKey=%s uploadId=%s",
+		req.JobID, start.UnixMilli(), req.FileIndex, req.NextPartNum, req.MaxParts, req.PartSize, req.ZipOffset, req.OutputKey, redact(req.UploadID))
 
 	zipOffset, err := parseBigInt(req.ZipOffset)
 	if err != nil {
@@ -332,8 +336,18 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		FilesDone: filesDone,
 		Done: done,
 	}
+
+	log.Printf("[runChunk] done jobId=%s durationMs=%d uploadedParts=%d nextPart=%d fileIndex=%d filesDone=%d done=%t bytesWrittenTotal=%s",
+		req.JobID, time.Since(start).Milliseconds(), len(resp.UploadedParts), resp.NextPartNumber, resp.FileIndex, resp.FilesDone, resp.Done, resp.BytesWrittenTotal)
 	w.Header().Set("content-type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func redact(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8] + "..."
 }
 
 // ---------------- Multipart uploader ----------------

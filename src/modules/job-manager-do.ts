@@ -83,6 +83,21 @@ function nowMs() {
 
 // bigint helpers intentionally omitted in v1 (we persist offsets as decimal strings).
 
+function checkpointSummary(cp: Checkpoint) {
+  return {
+    manifestKey: cp.manifestKey,
+    outputKey: cp.outputKey,
+    uploadId: cp.uploadId ? `${cp.uploadId.slice(0, 8)}...` : undefined,
+    partSize: cp.partSize,
+    nextPartNumber: cp.nextPartNumber,
+    fileIndex: cp.fileIndex,
+    zipOffset: cp.zipOffset,
+    bytesWrittenTotal: cp.bytesWrittenTotal,
+    filesDone: cp.filesDone,
+    done: cp.done,
+  };
+}
+
 export class JobManagerDO {
   constructor(
     private readonly state: DurableObjectState,
@@ -202,11 +217,20 @@ export class JobManagerDO {
   }
 
   private async handleTick(jobId: string): Promise<TickJobResponse> {
+    const tickStartMs = nowMs();
     const job = this.getJobRow(jobId);
     const checkpoint = this.getCheckpoint(jobId);
     if (!job || !checkpoint) {
       throw new Error(`No Job or Checkpoint found for job: ${jobId}`);
     }
+
+    console.log(`[zip-v2] Tick start.`, {
+      jobId,
+      jobStatus: job.status,
+      transferId: job.transferId,
+      tickStartMs,
+      checkpoint: checkpointSummary(checkpoint),
+    });
 
     if (job.status === "DONE" || job.status === "FAILED" || job.status === "CANCELLED") {
       console.log(`[zip-v2] Job already completed.`, {
@@ -240,16 +264,19 @@ export class JobManagerDO {
     const semaphore = this.env.ZipSemaphore.get(semaphoreId);
     const desired = toInt(this.env.ZIP_GLOBAL_CONCURRENCY, 1);
 
+    const acquireStartMs = nowMs();
     const acquiredResp = await semaphore.fetch("https://semaphore/acquire", {
       method: "POST",
       body: JSON.stringify({ jobId, limit: desired }),
     });
+    const acquireDurationMs = nowMs() - acquireStartMs;
 
     if (!acquiredResp.ok) {
       const errText = await acquiredResp.text();
       console.error(`[zip-v2] Failed to acquire semaphore.`, {
         error: errText,
         status: acquiredResp.status,
+        durationMs: acquireDurationMs,
         jobId,
         transferId: job.transferId,
         bundleObjectKey: checkpoint.outputKey,
@@ -273,6 +300,7 @@ export class JobManagerDO {
       // Create a new multipart upload if it doesn't exist
       const maxParts = toInt(this.env.ZIP_MAX_PARTS_PER_TICK, DEFAULT_NUMBER_OF_PARTS);
       if (!checkpoint.uploadId) {
+        const createUploadStartMs = nowMs();
         const upload = await this.env.OUTPUT_BUCKET.createMultipartUpload(checkpoint.outputKey, {
           customMetadata: {
             jobId,
@@ -281,8 +309,16 @@ export class JobManagerDO {
             zipVersion: ZIP_V2_VERSION,
           },
         });
+        const createUploadDurationMs = nowMs() - createUploadStartMs;
         checkpoint.uploadId = upload.uploadId;
         this.upsertCheckpoint(jobId, checkpoint);
+        console.log(`[zip-v2] Multipart upload created.`, {
+          jobId,
+          transferId: job.transferId,
+          outputKey: checkpoint.outputKey,
+          uploadId: `${upload.uploadId.slice(0, 8)}...`,
+          durationMs: createUploadDurationMs,
+        });
       }
 
       // Run the container to upload the next parts
@@ -290,6 +326,7 @@ export class JobManagerDO {
       const containerStub = this.env.ZipContainer.get(containerId);
 
       // Forward the request to the container
+      const runChunkStartMs = nowMs();
       const runResp = await containerStub.fetch("https://zip/runChunk", {
         method: "POST",
         body: JSON.stringify({
@@ -304,21 +341,38 @@ export class JobManagerDO {
           maxParts,
         }),
       });
+      const runChunkDurationMs = nowMs() - runChunkStartMs;
 
       if (!runResp.ok) {
         const errText = await runResp.text();
         console.error(`[zip-v2] Container run failed.`, {
           status: runResp.status,
           error: errText,
+          durationMs: runChunkDurationMs,
           jobId,
           transferId: job.transferId,
           bundleObjectKey: checkpoint.outputKey,
           manifestKey: checkpoint.manifestKey,
+          checkpoint: checkpointSummary(checkpoint),
         });
         throw new Error(`Container run failed: ${runResp.status} ${errText}`);
       }
 
       const run = (await runResp.json()) satisfies RunChunkResponse;
+
+      console.log(`[zip-v2] runChunk ok.`, {
+        jobId,
+        transferId: job.transferId,
+        durationMs: runChunkDurationMs,
+        maxParts,
+        uploadedPartsCount: run.uploadedParts?.length ?? 0,
+        nextPartNumber: run.nextPartNumber,
+        fileIndex: run.fileIndex,
+        zipOffset: run.zipOffset,
+        bytesWrittenTotal: run.bytesWrittenTotal,
+        filesDone: run.filesDone,
+        done: run.done,
+      });
 
       if (run.uploadedParts?.length) {
         this.insertUploadedParts(jobId, run.uploadedParts);
@@ -336,7 +390,9 @@ export class JobManagerDO {
 
       if (run.done) {
         // Container should have completed multipart; verify output exists and update status.
+        const verifyStartMs = nowMs();
         const out = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
+        const verifyDurationMs = nowMs() - verifyStartMs;
         if (!out) {
           throw new Error("Container reported done but output does not exist");
         }
@@ -360,10 +416,23 @@ export class JobManagerDO {
             }),
           );
 
+        console.log(`[zip-v2] Tick done (job complete).`, {
+          jobId,
+          transferId: job.transferId,
+          outputKey: checkpoint.outputKey,
+          outputBytes: out.size,
+          verifyDurationMs,
+          tickDurationMs: nowMs() - tickStartMs,
+        });
         return { status: "DONE", done: true };
       }
 
       // Not done; caller should enqueue another tick.
+      console.log(`[zip-v2] Tick done (job still running).`, {
+        jobId,
+        transferId: job.transferId,
+        tickDurationMs: nowMs() - tickStartMs,
+      });
       return { status: "RUNNING", done: false };
     } catch (err: any) {
       console.error(`[zip-v2] job failed jobId=${jobId}`, {
@@ -372,6 +441,8 @@ export class JobManagerDO {
         transferId: job.transferId,
         bundleObjectKey: checkpoint.outputKey,
         manifestKey: checkpoint.manifestKey,
+        tickDurationMs: nowMs() - tickStartMs,
+        checkpoint: checkpointSummary(checkpoint),
       });
       this.upsertJob({
         ...job,
