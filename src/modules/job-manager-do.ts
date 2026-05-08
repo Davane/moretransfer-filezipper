@@ -6,6 +6,8 @@ type JobStatus = "PENDING" | "RUNNING" | "FINALIZING" | "DONE" | "FAILED" | "CAN
 
 type UploadedPart = { partNumber: number; etag: string; sizeBytes: number };
 
+type CompletePart = { partNumber: number; etag: string };
+
 type ErrorKind =
   | "container_5xx"
   | "container_429"
@@ -178,6 +180,24 @@ function classifyContainerFailure(
   }
 
   return { retryable: true, kind: "unknown" };
+}
+
+function classifyFinalizeFailure(errText: string): { retryable: boolean; kind: ErrorKind } {
+  // Finalization errors are usually transient storage/network issues; be conservative.
+  const s = errText.toLowerCase();
+  if (s.includes("eof") || s.includes("connection reset") || s.includes("broken pipe")) {
+    return { retryable: true, kind: "r2_eof" };
+  }
+  if (s.includes("timeout") || s.includes("deadline")) {
+    return { retryable: true, kind: "container_timeout" };
+  }
+  if (s.includes("400") || s.includes("403") || s.includes("404")) {
+    return { retryable: false, kind: "container_4xx" };
+  }
+  if (s.includes("429")) {
+    return { retryable: true, kind: "container_429" };
+  }
+  return { retryable: true, kind: "r2_transient" };
 }
 
 class ContainerRunError extends Error {
@@ -444,6 +464,27 @@ export class JobManagerDO {
       throw new Error(`No Job or Checkpoint found for job: ${jobId}`);
     }
 
+    // If we were in FINALIZING, skip runChunk and attempt multipart completion.
+    if (job.status === "FINALIZING") {
+      const finalized = await this.finalizeMultipartIfNeeded(jobId, job, checkpoint);
+      if (!finalized) {
+        await this.scheduleNextTick(jobId, { ...job, status: "FINALIZING" });
+        return { status: "FINALIZING", done: false };
+      }
+
+      const { outputBytes, verifyDurationMs } = await this.verifyFinalOutput(checkpoint);
+      await this.scheduleCleanup(jobId, { ...job, status: "DONE" });
+      console.log(`[zip-v2] Tick done (job complete).`, {
+        jobId,
+        transferId: job.transferId,
+        outputKey: checkpoint.outputKey,
+        outputBytes,
+        verifyDurationMs,
+        tickDurationMs: nowMs() - tickStartMs,
+      });
+      return { status: "DONE", done: true };
+    }
+
     if (job.nextRetryAtMs && nowMs() < job.nextRetryAtMs) {
       const retryAfterSeconds = Math.max(1, Math.ceil((job.nextRetryAtMs - nowMs()) / 1000));
       console.log(`[zip-v2] Tick skipped (backoff).`, {
@@ -635,11 +676,19 @@ export class JobManagerDO {
       } satisfies Checkpoint);
 
       if (run.done) {
-        // Container should have completed multipart; verify output exists and update status.
+        // Finalization stage: complete multipart using the full persisted parts list.
+        this.upsertJob({ ...job, status: "FINALIZING", updatedAtMs: nowMs() });
+        const finalized = await this.finalizeMultipartIfNeeded(jobId, { ...job, status: "FINALIZING" }, checkpoint);
+        if (!finalized) {
+          await this.scheduleNextTick(jobId, { ...job, status: "FINALIZING" });
+          return { status: "FINALIZING", done: false };
+        }
+
+        // Verify output exists and update status.
         const { outputBytes, verifyDurationMs } = await this.verifyFinalOutput(checkpoint);
 
         // Schedule cleanup after successful verification
-        await this.scheduleCleanup(jobId, job);
+        await this.scheduleCleanup(jobId, { ...job, status: "DONE" });
 
         // Best-effort status callback
         const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
@@ -727,6 +776,80 @@ export class JobManagerDO {
       outputBytes: out.size,
       verifyDurationMs,
     };
+  }
+
+  private async finalizeMultipartIfNeeded(jobId: string, job: JobStateRow, checkpoint: Checkpoint) {
+    // Idempotency: if output already exists, consider it finalized.
+    const existing = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
+    if (existing) {
+      console.log(`[zip-v2] Finalization skipped (output exists).`, {
+        jobId,
+        transferId: job.transferId,
+        outputKey: checkpoint.outputKey,
+        outputBytes: existing.size,
+      });
+      return true;
+    }
+
+    if (!checkpoint.uploadId) {
+      throw new Error("Missing uploadId during finalization");
+    }
+
+    const parts = this.listUploadedPartsForComplete(jobId);
+    if (!parts.length) {
+      throw new Error("No uploaded parts found for finalization");
+    }
+
+    console.log(`[zip-v2] Finalizing multipart.`, {
+      jobId,
+      transferId: job.transferId,
+      outputKey: checkpoint.outputKey,
+      uploadId: `${checkpoint.uploadId.slice(0, 8)}...`,
+      partsCount: parts.length,
+      firstPartNumber: parts[0]?.partNumber,
+      lastPartNumber: parts[parts.length - 1]?.partNumber,
+    });
+
+    try {
+      const up = this.env.OUTPUT_BUCKET.resumeMultipartUpload(checkpoint.outputKey, checkpoint.uploadId);
+      await up.complete(parts);
+      console.log(`[zip-v2] Multipart complete succeeded.`, {
+        jobId,
+        transferId: job.transferId,
+        outputKey: checkpoint.outputKey,
+        partsCount: parts.length,
+      });
+      return true;
+    } catch (e) {
+      const errText = String((e as any)?.message ?? e);
+      const { retryable, kind } = classifyFinalizeFailure(errText);
+      console.warn(`[zip-v2] Multipart complete failed.`, {
+        jobId,
+        transferId: job.transferId,
+        outputKey: checkpoint.outputKey,
+        retryable,
+        errorKind: kind,
+        error: errText,
+      });
+
+      if (!retryable) {
+        throw e as any;
+      }
+
+      // Mark error state but keep job FINALIZING; scheduler will retry on next tick.
+      const intervalMs = toInt((this.env as any).ZIP_V2_TICK_INTERVAL_MS, DEFAULT_TICK_INTERVAL_MS);
+      const nextTickAtMs = nowMs() + Math.max(0, intervalMs);
+      this.upsertJob({
+        ...job,
+        status: "FINALIZING",
+        updatedAtMs: nowMs(),
+        errorMessage: errText,
+        lastErrorKind: kind,
+        nextTickAtMs,
+      });
+      await this.state.storage.setAlarm(nextTickAtMs);
+      return false;
+    }
   }
 
   private async scheduleNextTick(jobId: string, job: JobStateRow) {
@@ -1099,6 +1222,17 @@ export class JobManagerDO {
         p.sizeBytes,
       );
     }
+  }
+
+  private listUploadedPartsForComplete(jobId: string): CompletePart[] {
+    const sql = this.sql();
+    const rs = sql.exec(
+      `SELECT partNumber, etag
+       FROM uploaded_parts WHERE jobId = ? ORDER BY partNumber ASC;`,
+      jobId,
+    );
+    const rows = rs.toArray?.() ?? [];
+    return rows.map((r: any) => ({ partNumber: r.partNumber, etag: r.etag })) satisfies CompletePart[];
   }
 
   private upsertZipEntry(

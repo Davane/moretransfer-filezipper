@@ -317,10 +317,8 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = uploaded
-		if err := completeMultipart(ctx, req.OutputKey, req.UploadID, uploader.AllParts()); err != nil {
-			http.Error(w, "complete multipart failed: "+err.Error(), 500)
-			return
-		}
+		// Multipart completion is performed by the coordinator (JobManagerDO), which has
+		// the full ordered list of uploaded parts across all /runChunk calls.
 	} else {
 		// For non-final chunks, we intentionally do NOT flush a partial buffer. Doing so
 		// would create a small part in the middle of the multipart stream and complicate
