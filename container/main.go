@@ -17,7 +17,12 @@ import (
 	"time"
 )
 
-// ZIP constants/signatures
+// ZIP constants/signatures.
+//
+// This file writes ZIP records manually (no archive/zip) because we need:
+// - streaming output (can't seek back to fill sizes)
+// - resumability via multipart upload checkpoints
+// - ZIP64 structures so offsets/sizes can exceed 32-bit limits.
 const (
 	sigLocal          = 0x04034b50
 	sigDataDescriptor = 0x08074b50
@@ -34,6 +39,15 @@ const (
 	maxU32 = 0xffffffff
 )
 
+// RunChunkRequest is the input contract for POST /runChunk.
+//
+// The caller (typically a coordinator) supplies the current checkpoint:
+// - which manifest file index we are at
+// - the ZIP byte offset already written/uploaded
+// - the multipart next part number.
+//
+// This service will continue from that checkpoint, uploading at most MaxParts
+// *new* parts, but it only stops at file boundaries to keep ZIP structures intact.
 type RunChunkRequest struct {
 	JobID         string `json:"jobId"`
 	ManifestKey   string `json:"manifestKey"`
@@ -46,12 +60,18 @@ type RunChunkRequest struct {
 	MaxParts      int    `json:"maxParts"`
 }
 
+// UploadedPart is the minimal information required to complete an R2/S3-style
+// multipart upload: part number, etag, and the bytes uploaded for that part.
 type UploadedPart struct {
 	PartNumber int    `json:"partNumber"`
 	Etag       string `json:"etag"`
 	SizeBytes  int    `json:"sizeBytes"`
 }
 
+// CentralEntry is the metadata needed to write a central directory record later.
+//
+// We persist these as we go (via JobManager DO) because the central directory is
+// written only at the end, but the build is chunked across many /runChunk calls.
 type CentralEntry struct {
 	NameB64         string `json:"nameB64"`
 	CRC32           uint32 `json:"crc32"`
@@ -62,6 +82,8 @@ type CentralEntry struct {
 	ModDate         uint16 `json:"modDate"`
 }
 
+// RunChunkResponse returns an updated checkpoint that lets the caller resume:
+// nextPartNumber, fileIndex, zipOffset, and the parts uploaded during this call.
 type RunChunkResponse struct {
 	UploadedParts    []UploadedPart `json:"uploadedParts"`
 	NextPartNumber   int            `json:"nextPartNumber"`
@@ -72,6 +94,8 @@ type RunChunkResponse struct {
 	Done             bool           `json:"done"`
 }
 
+// Manifest describes the work to be performed (what objects to zip, expected sizes,
+// and their names inside the archive). It is fetched from output storage.
 type Manifest struct {
 	Version     string `json:"version"`
 	JobID       string `json:"jobId"`
@@ -96,6 +120,14 @@ func main() {
 	}
 }
 
+// handleRunChunk incrementally builds a ZIP64 stream and uploads it via multipart.
+//
+// Important properties/assumptions:
+// - Resumability is based on an external checkpoint: zipOffset, nextPartNumber, fileIndex,
+//   and the JobManager DO's persisted central directory entries.
+// - We stop only at file boundaries (never mid-file) so the caller can safely resume
+//   without having to re-stream partial file data.
+// - We always write ZIP64 central directory entries and ZIP64 EOCD structures.
 func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -127,6 +159,8 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load previously recorded central directory entries from JobManager DO.
+	// These must include every file completed in prior chunks; otherwise the final
+	// central directory won't match the file data already uploaded.
 	entries, err := fetchEntries(ctx, req.JobID)
 	if err != nil {
 		http.Error(w, "entries fetch failed: "+err.Error(), 500)
@@ -164,6 +198,8 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Stream the source object into the ZIP stream, while computing CRC32.
+		// We use "store" (no compression), so compressedSize == uncompressedSize.
 		buf := make([]byte, 1024*1024)
 		for {
 			n, readErr := rc.Read(buf)
@@ -189,10 +225,14 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		_ = rc.Close()
 
 		if size != f.Size {
+			// Manifest is treated as authoritative; a mismatch likely indicates a bad
+			// manifest, a racing overwrite, or reading the wrong object version.
 			http.Error(w, fmt.Sprintf("size mismatch %s expected %d got %d", f.Key, f.Size, size), 500)
 			return
 		}
 
+		// Because the local header is written before we know CRC/sizes, we must emit a
+		// data descriptor. We always write the ZIP64 variant with 8-byte sizes.
 		if err := writeDataDescriptor(uploader, crc, uint64(size), uint64(size)); err != nil {
 			http.Error(w, "write data descriptor failed: "+err.Error(), 500)
 			return
@@ -215,7 +255,15 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 
 		filesDone = i + 1
 
-		// Chunking: stop only at file boundary. If we already uploaded >= MaxParts, exit.
+		// Chunking: stop only at file boundary.
+		//
+		// Watch out: this means we will not split a single large file across multiple
+		// /runChunk calls. If a single file is enormous, this chunk may exceed MaxParts
+		// and runtime expectations because we finish the current file before stopping.
+		//
+		// We use the number of parts uploaded (not bytes) because the coordinator
+		// typically budgets per-container runtime based on predictable part sizes and
+		// request counts.
 		partsUploadedThisRun += uploader.PartsUploadedThisRun
 		uploader.PartsUploadedThisRun = 0
 		if partsUploadedThisRun >= req.MaxParts {
@@ -226,6 +274,9 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 	done := filesDone >= len(manifest.Files)
 
 	if done {
+		// Finalization stage: write the central directory and end records.
+		// At this point the output stream becomes immutable; after we complete the
+		// multipart upload, the resulting object should be a valid ZIP64 archive.
 		centralDirOffset := uploader.Offset
 		for _, e := range entries {
 			if err := writeCentralDirectoryEntry(uploader, e); err != nil {
@@ -250,6 +301,7 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Flush final part and complete multipart
+		// Note: final part may be smaller than PartSize; multipart APIs allow that.
 		uploaded, err := uploader.FlushFinal()
 		if err != nil {
 			http.Error(w, "flush final failed: "+err.Error(), 500)
@@ -261,7 +313,9 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// For non-final chunks, flush any full parts already uploaded by uploader; do not flush partial buffer.
+		// For non-final chunks, we intentionally do NOT flush a partial buffer. Doing so
+		// would create a small part in the middle of the multipart stream and complicate
+		// "budgeting by parts" and resumability assumptions.
 	}
 
 	resp := RunChunkResponse{
@@ -279,12 +333,17 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 
 // ---------------- Multipart uploader ----------------
 
+// BigInt is a convenience wrapper used to carry byte offsets/sizes as strings.
+//
+// Watch out: despite the name, it is only uint64 (not arbitrary precision). If offsets
+// or sizes exceed 2^64-1, these operations will overflow and corrupt the ZIP layout.
 type BigInt struct{ n uint64 }
 
 func (b BigInt) String() string { return fmt.Sprintf("%d", b.n) }
 func (b BigInt) Add(o BigInt) BigInt { return BigInt{n: b.n + o.n} }
 func (b BigInt) Sub(o BigInt) BigInt { return BigInt{n: b.n - o.n} }
 
+// parseBigInt parses base-10 unsigned integers (used for JSON portability).
 func parseBigInt(s string) (BigInt, error) {
 	u, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
@@ -293,6 +352,10 @@ func parseBigInt(s string) (BigInt, error) {
 	return BigInt{n: u}, nil
 }
 
+// MultipartUploader turns sequential writes into fixed-size multipart uploads.
+//
+// It buffers bytes until PartSize is reached, uploads that buffer as a part, and then
+// continues. Offset is the total number of bytes written into the ZIP stream.
 type MultipartUploader struct {
 	OutputKey string
 	UploadID  string
@@ -306,6 +369,7 @@ type MultipartUploader struct {
 	PartsUploadedThisRun int
 }
 
+// NewMultipartUploader constructs a new uploader with an empty part buffer.
 func NewMultipartUploader(outputKey, uploadId string, partSize, nextPart int) *MultipartUploader {
 	return &MultipartUploader{
 		OutputKey: outputKey,
@@ -317,6 +381,7 @@ func NewMultipartUploader(outputKey, uploadId string, partSize, nextPart int) *M
 	}
 }
 
+// Write appends bytes to the current part buffer and uploads full parts as needed.
 func (u *MultipartUploader) Write(p []byte) error {
 	for len(p) > 0 {
 		space := u.PartSize - u.buf.Len()
@@ -342,9 +407,13 @@ func (u *MultipartUploader) Write(p []byte) error {
 	return nil
 }
 
+// flushFull uploads the current buffer as a full multipart part.
 func (u *MultipartUploader) flushFull() error {
 	partNum := u.NextPartNumber
 	body := bytes.NewReader(u.buf.Bytes())
+	// Watch out: this uses context.Background(), so request cancellation/timeouts from
+	// handleRunChunk will NOT interrupt an in-flight uploadPart call. If you need strict
+	// cancellation, pass the request ctx through the uploader and into uploadPart.
 	etag, size, err := uploadPart(context.Background(), u.OutputKey, u.UploadID, partNum, body)
 	if err != nil {
 		return err
@@ -356,12 +425,14 @@ func (u *MultipartUploader) flushFull() error {
 	return nil
 }
 
+// FlushFinal uploads any remaining buffered bytes as the final multipart part.
 func (u *MultipartUploader) FlushFinal() (UploadedPart, error) {
 	if u.buf.Len() == 0 {
 		return UploadedPart{}, nil
 	}
 	partNum := u.NextPartNumber
 	body := bytes.NewReader(u.buf.Bytes())
+	// Watch out: same as flushFull()—this ignores request context cancellation.
 	etag, size, err := uploadPart(context.Background(), u.OutputKey, u.UploadID, partNum, body)
 	if err != nil {
 		return UploadedPart{}, err
@@ -373,12 +444,14 @@ func (u *MultipartUploader) FlushFinal() (UploadedPart, error) {
 	return up, nil
 }
 
+// AllParts returns the parts uploaded so far (used to complete multipart uploads).
 func (u *MultipartUploader) AllParts() []UploadedPart {
 	return u.UploadedParts
 }
 
 // ---------------- Outbound helper calls ----------------
 
+// fetchManifest loads the zip job manifest from output storage.
 func fetchManifest(ctx context.Context, manifestKey string) (*Manifest, error) {
 	u := "http://output.r2/object/" + url.PathEscape(manifestKey)
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -398,6 +471,7 @@ func fetchManifest(ctx context.Context, manifestKey string) (*Manifest, error) {
 	return &m, nil
 }
 
+// getSourceObject returns a streaming reader for the source object content.
 func getSourceObject(ctx context.Context, key string) (io.ReadCloser, error) {
 	u := "http://source.r2/object/" + url.PathEscape(key)
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -413,6 +487,8 @@ func getSourceObject(ctx context.Context, key string) (io.ReadCloser, error) {
 	return res.Body, nil
 }
 
+// uploadPart uploads one multipart part to output storage.
+// The service is expected to respond with headers containing the ETag and size.
 func uploadPart(ctx context.Context, key, uploadId string, partNumber int, body io.Reader) (string, int, error) {
 	u := fmt.Sprintf("http://output.r2/uploadPart?key=%s&uploadId=%s&partNumber=%d", url.QueryEscape(key), url.QueryEscape(uploadId), partNumber)
 	req, _ := http.NewRequestWithContext(ctx, "POST", u, body)
@@ -431,6 +507,7 @@ func uploadPart(ctx context.Context, key, uploadId string, partNumber int, body 
 	return etag, size, nil
 }
 
+// completeMultipart finalizes the multipart upload by sending the full ordered part list.
 func completeMultipart(ctx context.Context, key, uploadId string, parts []UploadedPart) error {
 	u := fmt.Sprintf("http://output.r2/complete?key=%s&uploadId=%s", url.QueryEscape(key), url.QueryEscape(uploadId))
 	body, _ := json.Marshal(parts)
@@ -448,6 +525,7 @@ func completeMultipart(ctx context.Context, key, uploadId string, parts []Upload
 	return nil
 }
 
+// fetchEntries retrieves previously persisted central directory entries from the JobManager DO.
 func fetchEntries(ctx context.Context, jobId string) ([]CentralEntry, error) {
 	u := "http://job.do/entries?jobId=" + url.QueryEscape(jobId)
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -467,6 +545,8 @@ func fetchEntries(ctx context.Context, jobId string) ([]CentralEntry, error) {
 	return out, nil
 }
 
+// appendEntry persists one central directory entry into the JobManager DO.
+// This is how the build can resume later without re-walking completed files.
 func appendEntry(ctx context.Context, jobId string, entry CentralEntry, fileIndex int) error {
 	u := "http://job.do/entries?jobId=" + url.QueryEscape(jobId) + "&fileIndex=" + strconv.Itoa(fileIndex)
 	body, _ := json.Marshal(entry)
@@ -486,12 +566,16 @@ func appendEntry(ctx context.Context, jobId string, entry CentralEntry, fileInde
 
 // ---------------- ZIP writer helpers ----------------
 
+// normalizeZipPath forces forward slashes and strips any leading slash so entries are
+// relative within the archive. This avoids platform-specific path separators.
 func normalizeZipPath(p string) string {
 	p = strings.ReplaceAll(p, "\\", "/")
 	p = strings.TrimPrefix(p, "/")
 	return p
 }
 
+// dosDateTimeNow returns the current time encoded in MS-DOS date/time format,
+// as required by the ZIP spec for file headers.
 func dosDateTimeNow() (uint16, uint16) {
 	t := time.Now()
 	sec := t.Second() / 2
@@ -500,6 +584,7 @@ func dosDateTimeNow() (uint16, uint16) {
 	return dt, dd
 }
 
+// Little-endian integer encoders used when constructing ZIP structures.
 func u16(v uint16) []byte {
 	return []byte{byte(v), byte(v >> 8)}
 }
@@ -519,6 +604,10 @@ func u64(v uint64) []byte {
 	}
 }
 
+// writeLocalHeader writes a ZIP local file header for a stored (uncompressed) file.
+//
+// We set CRC and sizes to 0 and rely on the data descriptor that follows the file data
+// because we are streaming and cannot seek back to patch the header.
 func writeLocalHeader(w *MultipartUploader, name []byte, modTime, modDate uint16) error {
 	var b bytes.Buffer
 	b.Write(u32(sigLocal))
@@ -536,6 +625,8 @@ func writeLocalHeader(w *MultipartUploader, name []byte, modTime, modDate uint16
 	return w.Write(b.Bytes())
 }
 
+// writeDataDescriptor writes the post-data descriptor that carries CRC + sizes.
+// We always use the ZIP64 layout (8-byte sizes).
 func writeDataDescriptor(w *MultipartUploader, crc uint32, comp, uncomp uint64) error {
 	var b bytes.Buffer
 	b.Write(u32(sigDataDescriptor))
@@ -545,6 +636,10 @@ func writeDataDescriptor(w *MultipartUploader, crc uint32, comp, uncomp uint64) 
 	return w.Write(b.Bytes())
 }
 
+// writeCentralDirectoryEntry writes a ZIP central directory header for one file.
+//
+// We always emit ZIP64 extra fields containing the true sizes and local header offset,
+// and we write 0xFFFFFFFF placeholders in the 32-bit fields per the ZIP64 spec.
 func writeCentralDirectoryEntry(w *MultipartUploader, e CentralEntry) error {
 	name, err := base64.StdEncoding.DecodeString(e.NameB64)
 	if err != nil {
@@ -584,6 +679,7 @@ func writeCentralDirectoryEntry(w *MultipartUploader, e CentralEntry) error {
 	return w.Write(b.Bytes())
 }
 
+// writeZip64EndOfCentralDirectory writes the ZIP64 EOCD record summarizing the archive.
 func writeZip64EndOfCentralDirectory(w *MultipartUploader, totalEntries uint64, centralSize, centralOffset BigInt) error {
 	var b bytes.Buffer
 	b.Write(u32(sigZip64Eocd))
@@ -599,6 +695,7 @@ func writeZip64EndOfCentralDirectory(w *MultipartUploader, totalEntries uint64, 
 	return w.Write(b.Bytes())
 }
 
+// writeZip64EndOfCentralDirectoryLocator points ZIP readers to the ZIP64 EOCD record.
 func writeZip64EndOfCentralDirectoryLocator(w *MultipartUploader, zip64EocdOffset BigInt) error {
 	var b bytes.Buffer
 	b.Write(u32(sigZip64Locator))
@@ -608,6 +705,9 @@ func writeZip64EndOfCentralDirectoryLocator(w *MultipartUploader, zip64EocdOffse
 	return w.Write(b.Bytes())
 }
 
+// writeEndOfCentralDirectory writes the classic EOCD record with placeholder sizes/offsets.
+// The real values are provided via ZIP64 structures; classic EOCD enables compatibility
+// with readers that expect it to exist even for ZIP64 archives.
 func writeEndOfCentralDirectory(w *MultipartUploader, n int) error {
 	count := n
 	if count > maxU16 {
@@ -625,7 +725,10 @@ func writeEndOfCentralDirectory(w *MultipartUploader, n int) error {
 	return w.Write(b.Bytes())
 }
 
-// silence unused imports in early iterations
+// Silence unused imports in early iterations.
+//
+// This container file has been iterated on quickly and sometimes shares snippets with
+// other implementations; keeping these avoids churn while stabilizing the build.
 var _ = os.Getenv
 var _ = strings.Builder{}
 var _ = url.Values{}

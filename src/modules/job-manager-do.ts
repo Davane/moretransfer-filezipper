@@ -1,4 +1,4 @@
-import { Env, TransferStatus, ZipJobManifest } from "../lib/types/types";
+import { Env, TransferStatus } from "../lib/types/types";
 import { WebAPIService } from "./web-api-service";
 import { toInt, toBool } from "./job-manifest";
 
