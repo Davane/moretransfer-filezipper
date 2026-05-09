@@ -8,6 +8,13 @@ type UploadedPart = { partNumber: number; etag: string; sizeBytes: number };
 
 type CompletePart = { partNumber: number; etag: string };
 
+class MissingMultipartPartsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MissingMultipartPartsError";
+  }
+}
+
 type ErrorKind =
   | "container_5xx"
   | "container_429"
@@ -90,7 +97,7 @@ const ZIP_V2_VERSION = "zip64-store-container-v1";
 const DEFAULT_NUMBER_OF_PARTS = 8;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = 8;
 const DEFAULT_RETRY_BASE_DELAY_SECONDS = 10;
-const CLEANUP_TTL_MS = 24 * 60 * 60 * 1000;
+const CLEANUP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const DEFAULT_TICK_INTERVAL_MS = 10_000;
 
 function jsonResponse(obj: unknown, status = 200) {
@@ -185,6 +192,9 @@ function classifyContainerFailure(
 function classifyFinalizeFailure(errText: string): { retryable: boolean; kind: ErrorKind } {
   // Finalization errors are usually transient storage/network issues; be conservative.
   const s = errText.toLowerCase();
+  if (s.includes("missing multipart parts")) {
+    return { retryable: false, kind: "unknown" };
+  }
   if (s.includes("eof") || s.includes("connection reset") || s.includes("broken pipe")) {
     return { retryable: true, kind: "r2_eof" };
   }
@@ -800,6 +810,27 @@ export class JobManagerDO {
       throw new Error("No uploaded parts found for finalization");
     }
 
+    // Guard: parts must be contiguous from 1..N (R2/S3 expects all parts).
+    // If this fails, completing the multipart will produce a corrupt object.
+    let expected = 1;
+    for (const p of parts) {
+      if (p.partNumber !== expected) {
+        const msg = `Missing multipart parts: expected partNumber=${expected} got=${p.partNumber}`;
+        console.error(`[zip-v2] Finalization blocked (missing parts).`, {
+          jobId,
+          transferId: job.transferId,
+          outputKey: checkpoint.outputKey,
+          expectedPartNumber: expected,
+          gotPartNumber: p.partNumber,
+          partsCount: parts.length,
+          firstPartNumber: parts[0]?.partNumber,
+          lastPartNumber: parts.at(-1)?.partNumber,
+        });
+        throw new MissingMultipartPartsError(msg);
+      }
+      expected++;
+    }
+
     console.log(`[zip-v2] Finalizing multipart.`, {
       jobId,
       transferId: job.transferId,
@@ -836,14 +867,33 @@ export class JobManagerDO {
         throw e as any;
       }
 
-      // Mark error state but keep job FINALIZING; scheduler will retry on next tick.
+      // Mark error state but keep job FINALIZING; scheduler will retry with exponential backoff.
+      const consecutiveFailures = (job.consecutiveFailures ?? 0) + 1;
+      const maxConsecutiveFailures = toInt(
+        (this.env as any).ZIP_V2_MAX_CONSECUTIVE_FAILURES,
+        DEFAULT_MAX_CONSECUTIVE_FAILURES,
+      );
+      const baseDelaySeconds = toInt(
+        (this.env as any).ZIP_V2_RETRY_BASE_DELAY_SECONDS,
+        DEFAULT_RETRY_BASE_DELAY_SECONDS,
+      );
+      if (consecutiveFailures >= maxConsecutiveFailures) {
+        // Escalate to caller so the normal failure path marks FAILED + schedules cleanup.
+        throw e as any;
+      }
+
+      const backoffSeconds = computeBackoffSeconds(consecutiveFailures, baseDelaySeconds);
+      const nextRetryAtMs = nowMs() + backoffSeconds * 1000 + jitterMs(1000);
       const intervalMs = toInt((this.env as any).ZIP_V2_TICK_INTERVAL_MS, DEFAULT_TICK_INTERVAL_MS);
-      const nextTickAtMs = nowMs() + Math.max(0, intervalMs);
+      const nextTickAtMs = Math.max(nowMs() + intervalMs, nextRetryAtMs);
       this.upsertJob({
         ...job,
         status: "FINALIZING",
         updatedAtMs: nowMs(),
         errorMessage: errText,
+        consecutiveFailures,
+        lastFailureAtMs: nowMs(),
+        nextRetryAtMs,
         lastErrorKind: kind,
         nextTickAtMs,
       });
