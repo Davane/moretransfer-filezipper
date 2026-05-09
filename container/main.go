@@ -275,7 +275,11 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		// request counts.
 		partsUploadedThisRun += uploader.PartsUploadedThisRun
 		uploader.PartsUploadedThisRun = 0
-		if partsUploadedThisRun >= req.MaxParts {
+		// Important: never stop a chunk with a partially-filled multipart buffer.
+		// R2/S3 requires all non-trailing parts to have identical length (PartSize).
+		// If we were to stop while u.buf has bytes, resuming would require uploading a
+		// short non-trailing part, and completeMultipart would fail.
+		if partsUploadedThisRun >= req.MaxParts && uploader.buf.Len() == 0 {
 			break
 		}
 	}
@@ -320,22 +324,8 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		// Multipart completion is performed by the coordinator (JobManagerDO), which has
 		// the full ordered list of uploaded parts across all /runChunk calls.
 	} else {
-		// For non-final chunks, we MUST flush any partial buffer to keep checkpoints
-		// consistent across /runChunk calls.
-		//
-		// If we didn't flush here, `uploader.Offset` (and thus `zipOffset`) would include
-		// bytes that only exist in memory and were never uploaded as a multipart part.
-		// On the next /runChunk, the process would resume with an inflated zipOffset,
-		// corrupting ZIP64 locator offsets and central directory pointers.
-		//
-		// Multipart uploads allow intermediate parts to be smaller than PartSize as long
-		// as they meet the provider minimum (R2/S3: >= 5MiB). Our PartSize is 128MiB,
-		// so this is safe and keeps the archive readable.
-		_, err := uploader.FlushFinal()
-		if err != nil {
-			http.Error(w, "flush partial failed: "+err.Error(), 500)
-			return
-		}
+		// Non-final chunk: do not flush partial buffer.
+		// We rely on the chunking rule above to only stop on part boundaries.
 	}
 
 	resp := RunChunkResponse{
