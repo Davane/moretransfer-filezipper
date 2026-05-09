@@ -320,9 +320,22 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 		// Multipart completion is performed by the coordinator (JobManagerDO), which has
 		// the full ordered list of uploaded parts across all /runChunk calls.
 	} else {
-		// For non-final chunks, we intentionally do NOT flush a partial buffer. Doing so
-		// would create a small part in the middle of the multipart stream and complicate
-		// "budgeting by parts" and resumability assumptions.
+		// For non-final chunks, we MUST flush any partial buffer to keep checkpoints
+		// consistent across /runChunk calls.
+		//
+		// If we didn't flush here, `uploader.Offset` (and thus `zipOffset`) would include
+		// bytes that only exist in memory and were never uploaded as a multipart part.
+		// On the next /runChunk, the process would resume with an inflated zipOffset,
+		// corrupting ZIP64 locator offsets and central directory pointers.
+		//
+		// Multipart uploads allow intermediate parts to be smaller than PartSize as long
+		// as they meet the provider minimum (R2/S3: >= 5MiB). Our PartSize is 128MiB,
+		// so this is safe and keeps the archive readable.
+		_, err := uploader.FlushFinal()
+		if err != nil {
+			http.Error(w, "flush partial failed: "+err.Error(), 500)
+			return
+		}
 	}
 
 	resp := RunChunkResponse{
