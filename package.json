@@ -17,6 +17,8 @@
     "enqueue": "sh ./scripts/test-enqueue.sh",
     "unzip": "unzip -l /tmp/tr_demo.zip",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "deploy:dev": "wrangler deploy --env dev",
     "deploy:prod": "wrangler deploy --env prod",
     "queue:create": "wrangler queues create <queue-name>",
@@ -33,6 +35,7 @@
   },
   "devDependencies": {
     "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
     "wrangler": "^4.31.0"
   }
 }
