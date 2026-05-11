@@ -114,7 +114,7 @@ interface ZipMessage {
   data: ZipJob;
 }
 
-interface ZipV2TickMessage {
+export interface ZipV2TickMessage {
   type: QueueMessageType.ZIP_V2_TICK;
   data: ZipV2TickMessageData;
 }
@@ -125,3 +125,150 @@ interface StreamIngestMessage {
 }
 
 export type QueueMessage = ZipMessage | ZipV2TickMessage | StreamIngestMessage;
+
+
+// ------------------------------------------------------------------------------
+// Zip V2 Job Manager DO types
+// ------------------------------------------------------------------------------
+
+/**
+ * ZIP v2 (containers): centralized lifecycle and retries.
+ *
+ * `JobManagerDO` is the single scheduler. It owns the SQLite job state and
+ * `storage.setAlarm()`, and it is the only place where business backoff and
+ * `nextActionAtMs` are decided.
+ *
+ * The queue carries trigger-only `zip_v2_tick` messages so ticks can run within
+ * queue concurrency limits. Queue retries are reserved for infrastructure
+ * delivery failures only, such as RPC errors, unreachable DOs, or non-2xx
+ * responses from the DO.
+ *
+ * Canonical statuses:
+ * `PENDING` → `RUNNING` → `FINALIZING` → `DONE` | `FAILED`
+ *
+ * Canonical events used for logs and reasoning:
+ * - `startRequested`: row and checkpoint created; status is `PENDING`.
+ * - `tickDispatched`: queue consumer invoked `/tick`; work runs under the global semaphore.
+ * - `lockUnavailable`: global semaphore is busy; defer via `nextActionAtMs`.
+ * - `chunkSucceeded`: container uploaded parts and checkpoint advanced.
+ * - `chunkRetryableFailure`: container/R2 failure was classified as retryable.
+ * - `chunkTerminalFailure`: container/R2 failure was classified as terminal.
+ * - `allChunksUploaded`: checkpoint is complete; enter `FINALIZING` and complete multipart upload.
+ * - `finalizeRetryableFailure`: multipart completion failed with a retryable error.
+ * - `finalizeTerminalFailure`: multipart completion failed with a terminal error.
+ * - `outputVerified`: R2 head succeeded after finalize; mark `DONE` and schedule cleanup.
+ * - `cleanupDue`: alarm purges terminal row state after the cleanup TTL.
+ *
+ * Global semaphore:
+ * `ZipSemaphoreDO` limits concurrent container work only. It does not define job
+ * identity. Per-job idempotency is still enforced by the active `job_state` row,
+ * `transferId` / `jobId`, and output object existence.
+ *
+ * Manual reliability checks before and after deploy:
+ * - Container 429/5xx: job remains `RUNNING` / `FINALIZING`, `nextActionAtMs`
+ *   advances, and `consecutiveFailures` increments until the cap is reached.
+ * - Finalize transient then success: multipart completes, job becomes `DONE`,
+ *   and cleanup is scheduled.
+ * - Semaphore busy: a tick that did not acquire a token must not release one;
+ *   the next wake should be interval-based.
+ * - Duplicate `start` / existing R2 output: idempotent paths should avoid
+ *   duplicate multipart owners.
+ */
+export type JobStatus = "PENDING" | "RUNNING" | "FINALIZING" | "DONE" | "FAILED" | "CANCELLED";
+
+/** Log-friendly lifecycle event labels (not persisted). */
+export type ZipV2LifecycleEvent =
+  | "job.start.requested"
+  | "tick.dispatched"
+  | "lock.unavailable"
+  | "chunk.succeeded"
+  | "chunk.failure.retryable"
+  | "chunk.failure.terminal"
+  | "chunk.uploads_completed"
+  | "finalize.failure.retryable"
+  | "finalize.failure.terminal"
+  | "output.verified"
+  | "cleanup.due";
+
+export type UploadedPart = { partNumber: number; etag: string; sizeBytes: number };
+
+export type CompletePart = { partNumber: number; etag: string };
+
+export type ErrorKind =
+  | "container_5xx"
+  | "container_429"
+  | "container_4xx"
+  | "container_timeout"
+  | "r2_eof"
+  | "r2_transient"
+  | "bad_manifest"
+  | "unknown";
+
+export type ZipEntryRow = {
+  jobId: string;
+  fileIndex: number;
+  nameB64: string;
+  crc32: number;
+  compressedSize: string;
+  uncompressedSize: string;
+  localHeaderOffset: string;
+  modTime: number;
+  modDate: number;
+};
+
+export type Checkpoint = {
+  manifestKey: string;
+  outputKey: string;
+  uploadId?: string;
+  partSize: number;
+  nextPartNumber: number;
+  fileIndex: number;
+  zipOffset: string; // bigint as decimal string
+  bytesWrittenTotal: string; // bigint as decimal string
+  filesDone: number;
+  done: boolean;
+};
+
+export type JobStateRow = {
+  jobId: string;
+  transferId: string;
+  status: JobStatus;
+  createdAtMs: number;
+  updatedAtMs: number;
+  errorMessage?: string;
+  consecutiveFailures: number;
+  lastFailureAtMs?: number;
+  /** When the next tick / retry is allowed; sole non-cleanup wake field (replaces legacy nextTickAtMs + nextRetryAtMs). */
+  nextActionAtMs?: number;
+  lastErrorKind?: ErrorKind;
+  cleanupAtMs?: number;
+};
+
+export type StartJobRequest = {
+  jobId: string;
+  transferId: string;
+  manifestKey: string;
+  outputKey: string;
+};
+
+export type TickJobRequest = {
+  jobId: string;
+};
+
+export type TickJobResponse = {
+  status: JobStatus;
+  done: boolean;
+  retryAfterSeconds?: number;
+};
+
+export type RunChunkResponse = {
+  uploadedParts: UploadedPart[];
+  nextPartNumber: number;
+  fileIndex: number;
+  zipOffset: string;
+  bytesWrittenTotal: string;
+  filesDone: number;
+  done: boolean;
+};
+
+
