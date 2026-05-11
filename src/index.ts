@@ -4,6 +4,7 @@ import {
   QueueMessageType,
   RequestPath,
   ZipJob,
+  ZipV2LifecycleEvent,
   ZipV2TickMessage,
   ZipV2TickMessageData,
 } from "./lib/types/types";
@@ -103,7 +104,7 @@ export default {
           // Start a new zip v2 job by forwarding to JobManagerDO
           const jobManagerId = env.JobManager.idFromName(jobId);
           const jobManager = env.JobManager.get(jobManagerId);
-          
+
           const resp = await jobManager.fetch("https://job/start", {
             method: "POST",
             body: JSON.stringify({
@@ -254,15 +255,20 @@ async function handleZipV2Tick(msg: Message<ZipV2TickMessage>, env: Env) {
       await resp.json();
     } catch (parseErr: unknown) {
       const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-      console.error(`[zip-v2] Tick response JSON parse failed (job may still have progressed).`, {
+      console.error(`[zip-v2] tick JSON parse failed. Ack message to allow job to progress.`, {
         jobId,
         error: errMsg,
+        event: "tick.consumer.failure" satisfies ZipV2LifecycleEvent,
       });
     }
 
     msg.ack();
   } catch (e) {
-    console.error("[zip-v2] tick failed (infrastructure):", e);
+    console.error("[zip-v2] tick failed (infrastructure):", {
+      jobId,
+      error: e,
+      event: "tick.consumer.failure" satisfies ZipV2LifecycleEvent,
+    });
     msg.retry({ delaySeconds: 30 });
   }
 }

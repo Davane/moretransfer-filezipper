@@ -180,6 +180,11 @@ export type JobStatus = "PENDING" | "RUNNING" | "FINALIZING" | "DONE" | "FAILED"
 export type ZipV2LifecycleEvent =
   | "job.start.requested"
   | "tick.dispatched"
+  | "tick.dispatch.failed"
+  | "tick.consumer.failure"
+  | "tick.consumer.ack"
+  | "tick.processing"
+  | "tick.deferred"
   | "lock.unavailable"
   | "chunk.succeeded"
   | "chunk.failure.retryable"
@@ -187,8 +192,11 @@ export type ZipV2LifecycleEvent =
   | "chunk.uploads_completed"
   | "finalize.failure.retryable"
   | "finalize.failure.terminal"
+  | "finalize.deferred"
+  | "finalize.multipart_completed"
   | "output.verified"
-  | "cleanup.due";
+  | "cleanup.due"
+  | "cleanup.failure";
 
 export type UploadedPart = { partNumber: number; etag: string; sizeBytes: number };
 

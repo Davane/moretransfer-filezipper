@@ -36,7 +36,6 @@ import {
   DEFAULT_TICK_INTERVAL_MS,
 } from "../lib/constants";
 
-
 async function clearAlarmIfSupported(storage: DurableObjectStorage) {
   // deleteAlarm exists in newer runtime APIs; keep best-effort compatibility.
   const anyStorage: any = storage as any;
@@ -110,12 +109,17 @@ export class JobManagerDO {
         sql.exec(`DELETE FROM checkpoint WHERE jobId = ?;`, jobId);
         sql.exec(`DELETE FROM job_state WHERE jobId = ?;`, jobId);
 
-        console.log(`[zip-v2] Cleanup purged job state.`, { jobId, status });
+        console.log(`[zip-v2] Cleanup purged job state.`, {
+          jobId,
+          status,
+          event: "cleanup.due" satisfies ZipV2LifecycleEvent,
+        });
       } catch (e) {
         console.error(`[zip-v2] Cleanup failed.`, {
           jobId,
           status,
           error: String((e as any)?.message ?? e),
+          event: "cleanup.failure" satisfies ZipV2LifecycleEvent,
         });
       }
     }
@@ -141,12 +145,16 @@ export class JobManagerDO {
           data: { jobId },
         } as any);
         sql.exec(`UPDATE job_state SET nextActionAtMs = NULL WHERE jobId = ?;`, jobId);
-        console.log(`[zip-v2] Alarm enqueued tick.`, { jobId, event: "tickDispatched" });
+        console.log(`[zip-v2] Alarm enqueued tick.`, {
+          jobId,
+          event: "tick.dispatched" satisfies ZipV2LifecycleEvent,
+        });
       } catch (e) {
         // Keep nextActionAtMs so we try again on next alarm run.
         console.error(`[zip-v2] Alarm failed to enqueue tick.`, {
           jobId,
           error: String((e as any)?.message ?? e),
+          event: "tick.dispatch.failed" satisfies ZipV2LifecycleEvent,
         });
       }
     }
@@ -278,10 +286,33 @@ export class JobManagerDO {
       transferId,
       manifestKey,
       outputKey,
-      event: "startRequested",
+      event: "job.start.requested" satisfies ZipV2LifecycleEvent,
     });
 
     await this.rescheduleStorageAlarmFromDb();
+  }
+
+  /**
+   * If `nextActionAtMs` is still in the future, skip this tick and return a response (backoff in effect).
+   * Otherwise returns `null` so the caller continues.
+   */
+  private maybeReturnBackoffTickResponse(job: JobStateRow): TickJobResponse | null {
+    if (!job.nextActionAtMs || nowMs() >= job.nextActionAtMs) {
+      return null;
+    }
+    const retryAfterSeconds = Math.max(1, Math.ceil((job.nextActionAtMs - nowMs()) / 1000));
+
+    console.log(`[zip-v2] [${job.status}] Tick skipped (backoff).`, {
+      jobId: job.jobId,
+      transferId: job.transferId,
+      retryAfterSeconds,
+      consecutiveFailures: job.consecutiveFailures,
+      lastErrorKind: job.lastErrorKind,
+      nextActionAtMs: job.nextActionAtMs,
+      event: "tick.deferred" satisfies ZipV2LifecycleEvent,
+    });
+
+    return { status: job.status, done: false, retryAfterSeconds };
   }
 
   /**
@@ -292,26 +323,18 @@ export class JobManagerDO {
     const tickStartMs = nowMs();
     let job = this.getJobRow(jobId);
     const checkpoint = this.getCheckpoint(jobId);
+
     if (!job || !checkpoint) {
       throw new Error(`No Job or Checkpoint found for job: ${jobId}`);
     }
 
+    const backoffResponse = this.maybeReturnBackoffTickResponse(job);
+    if (backoffResponse) {
+      return backoffResponse;
+    }
+
     // If we were in FINALIZING, skip runChunk and attempt multipart completion.
     if (job.status === "FINALIZING") {
-      // Wait until `nextActionAtMs` — centralized backoff from `applyRetryableBackoff`.
-      if (job.nextActionAtMs && nowMs() < job.nextActionAtMs) {
-        const retryAfterSeconds = Math.max(1, Math.ceil((job.nextActionAtMs - nowMs()) / 1000));
-        console.log(`[zip-v2] Finalize tick skipped (backoff).`, {
-          jobId,
-          transferId: job.transferId,
-          retryAfterSeconds,
-          consecutiveFailures: job.consecutiveFailures,
-          lastErrorKind: job.lastErrorKind,
-          nextActionAtMs: job.nextActionAtMs,
-        });
-        return { status: "FINALIZING", done: false, retryAfterSeconds };
-      }
-
       try {
         const finalized = await this.finalizeMultipartIfNeeded(jobId, job, checkpoint);
         if (!finalized) {
@@ -319,7 +342,9 @@ export class JobManagerDO {
           console.log(`[zip-v2] Finalization deferred (alarm/backoff already scheduled).`, {
             jobId,
             transferId: job.transferId,
+            event: "finalize.deferred" satisfies ZipV2LifecycleEvent,
           });
+
           return { status: "FINALIZING", done: false };
         }
 
@@ -332,25 +357,14 @@ export class JobManagerDO {
           outputBytes,
           verifyDurationMs,
           tickDurationMs: nowMs() - tickStartMs,
+          event: "output.verified" satisfies ZipV2LifecycleEvent,
         });
+
         return { status: "DONE", done: true };
       } catch (e) {
         await this.failFinalizeJob(jobId, job, checkpoint, e);
         return { status: "FAILED", done: false };
       }
-    }
-
-    if (job.nextActionAtMs && nowMs() < job.nextActionAtMs) {
-      const retryAfterSeconds = Math.max(1, Math.ceil((job.nextActionAtMs - nowMs()) / 1000));
-      console.log(`[zip-v2] Tick skipped (backoff).`, {
-        jobId,
-        transferId: job.transferId,
-        retryAfterSeconds,
-        consecutiveFailures: job.consecutiveFailures,
-        lastErrorKind: job.lastErrorKind,
-        nextActionAtMs: job.nextActionAtMs,
-      });
-      return { status: job.status, done: false, retryAfterSeconds };
     }
 
     console.log(`[zip-v2] Tick start.`, {
@@ -359,6 +373,7 @@ export class JobManagerDO {
       transferId: job.transferId,
       tickStartMs,
       checkpoint: checkpointSummary(checkpoint),
+      event: "tick.processing" satisfies ZipV2LifecycleEvent,
     });
 
     if (job.status === "DONE" || job.status === "FAILED" || job.status === "CANCELLED") {
@@ -391,38 +406,14 @@ export class JobManagerDO {
     }
 
     // Global concurrency only — release must run only if we actually acquired (see `finally`).
-    const semaphoreId = this.env.ZipSemaphore.idFromName("global");
-    const semaphore = this.env.ZipSemaphore.get(semaphoreId);
-    const desired = toInt(this.env.ZIP_GLOBAL_CONCURRENCY, 1);
-
-    const acquireStartMs = nowMs();
-    const acquiredResp = await semaphore.fetch("https://semaphore/acquire", {
-      method: "POST",
-      body: JSON.stringify({ jobId, limit: desired }),
-    });
-    const acquireDurationMs = nowMs() - acquireStartMs;
-
-    if (!acquiredResp.ok) {
-      const errText = await acquiredResp.text();
-      console.error(`[zip-v2] Failed to acquire semaphore.`, {
-        error: errText,
-        status: acquiredResp.status,
-        durationMs: acquireDurationMs,
-        jobId,
-        transferId: job.transferId,
-        bundleObjectKey: checkpoint.outputKey,
-        manifestKey: checkpoint.manifestKey,
-        event: "lockUnavailable",
-      });
-
-      await this.scheduleNextProgressAction(jobId);
+    const semaphoreAcquired = await this.acquireSemaphore(job, checkpoint);
+    if (!semaphoreAcquired) {
       return {
         status: job.status,
         done: false,
       };
     }
 
-    let semaphoreAcquired = true;
     try {
       this.upsertJob({
         ...job,
@@ -430,31 +421,11 @@ export class JobManagerDO {
         updatedAtMs: nowMs(),
       });
 
-      // Create a new multipart upload if it doesn't exist
+      // Create a new multipart upload if it doesn't exist and update the checkpoint
       const maxParts = toInt(this.env.ZIP_MAX_PARTS_PER_TICK, DEFAULT_NUMBER_OF_PARTS);
       if (!checkpoint.uploadId) {
-        const createUploadStartMs = nowMs();
-        const upload = await this.env.OUTPUT_BUCKET.createMultipartUpload(checkpoint.outputKey, {
-          customMetadata: {
-            jobId,
-            transferId: job.transferId,
-            manifestKey: checkpoint.manifestKey,
-            zipVersion: ZIP_V2_VERSION,
-          },
-        });
-
-        const createUploadDurationMs = nowMs() - createUploadStartMs;
-        checkpoint.uploadId = upload.uploadId;
-
-        this.upsertCheckpoint(jobId, checkpoint);
-
-        console.log(`[zip-v2] Multipart upload created.`, {
-          jobId,
-          transferId: job.transferId,
-          outputKey: checkpoint.outputKey,
-          uploadId: `${upload.uploadId.slice(0, 8)}...`,
-          durationMs: createUploadDurationMs,
-        });
+        const newCheckpoint = await this.createMultipartUpload(job, checkpoint);
+        checkpoint.uploadId = newCheckpoint.uploadId;
       }
 
       // Run the container to upload the next parts
@@ -508,6 +479,9 @@ export class JobManagerDO {
         bytesWrittenTotal: run.bytesWrittenTotal,
         filesDone: run.filesDone,
         done: run.done,
+        event: (run.done
+          ? "chunk.uploads_completed"
+          : "chunk.succeeded") satisfies ZipV2LifecycleEvent,
       });
 
       if (job.consecutiveFailures > 0 || job.nextActionAtMs || job.lastErrorKind) {
@@ -555,6 +529,7 @@ export class JobManagerDO {
             console.log(`[zip-v2] Finalization deferred (alarm/backoff already scheduled).`, {
               jobId,
               transferId: job.transferId,
+              event: "finalize.deferred" satisfies ZipV2LifecycleEvent,
             });
             return { status: "FINALIZING", done: false };
           }
@@ -594,6 +569,7 @@ export class JobManagerDO {
           outputBytes,
           verifyDurationMs,
           tickDurationMs: nowMs() - tickStartMs,
+          event: "output.verified" satisfies ZipV2LifecycleEvent,
         });
 
         return { status: "DONE", done: true };
@@ -604,6 +580,7 @@ export class JobManagerDO {
         jobId,
         transferId: job.transferId,
         tickDurationMs: nowMs() - tickStartMs,
+        event: "chunk.succeeded" satisfies ZipV2LifecycleEvent,
       });
 
       await this.scheduleNextProgressAction(jobId);
@@ -616,7 +593,8 @@ export class JobManagerDO {
       return await this.handleTickFailure(err as Error, jobId, job, checkpoint, tickStartMs);
     } finally {
       if (semaphoreAcquired) {
-        await this.env.ZipSemaphore.get(semaphoreId).fetch("https://semaphore/release", {
+        const releaseId = this.env.ZipSemaphore.idFromName("global");
+        await this.env.ZipSemaphore.get(releaseId).fetch("https://semaphore/release", {
           method: "POST",
           body: JSON.stringify({ jobId }),
         });
@@ -624,9 +602,9 @@ export class JobManagerDO {
     }
   }
 
-  /** 
-   * Marks job `DONE` and schedules row purge after `CLEANUP_TTL_MS`. 
-   * Clears any pending chunk wake. 
+  /**
+   * Marks job `DONE` and schedules row purge after `CLEANUP_TTL_MS`.
+   * Clears any pending chunk wake.
    */
   private async scheduleCleanup(jobId: string, job: JobStateRow) {
     const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
@@ -645,12 +623,12 @@ export class JobManagerDO {
       jobId,
       transferId: job.transferId,
       cleanupAtMs,
-      event: "outputVerified",
+      event: "output.verified" satisfies ZipV2LifecycleEvent,
     });
   }
 
   /**
-   * Verifies the final output exists and returns the output size 
+   * Verifies the final output exists and returns the output size
    * and verification duration.
    */
   private async verifyFinalOutput(checkpoint: Checkpoint) {
@@ -688,6 +666,7 @@ export class JobManagerDO {
       bundleObjectKey: checkpoint.outputKey,
       manifestKey: checkpoint.manifestKey,
       checkpoint: checkpointSummary(checkpoint),
+      event: "finalize.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
     const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
@@ -707,6 +686,7 @@ export class JobManagerDO {
       jobId,
       transferId: fresh.transferId,
       cleanupAtMs,
+      event: "finalize.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
     const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
@@ -794,6 +774,7 @@ export class JobManagerDO {
         transferId: job.transferId,
         outputKey: checkpoint.outputKey,
         partsCount: parts.length,
+        event: "finalize.multipart_completed" satisfies ZipV2LifecycleEvent,
       });
       return true;
     } catch (e) {
@@ -817,7 +798,7 @@ export class JobManagerDO {
         holdStatus: "FINALIZING",
         errText,
         kind,
-        event: "finalize.failure.retryable",
+        event: "finalize.failure.retryable" satisfies ZipV2LifecycleEvent,
       });
       if (!scheduled.ok) {
         throw e;
@@ -850,7 +831,7 @@ export class JobManagerDO {
         holdStatus: "RUNNING",
         errText: rawErrText,
         kind,
-        event: "chunk.failure.retryable",
+        event: "chunk.failure.retryable" satisfies ZipV2LifecycleEvent,
       });
 
       if (scheduled.ok) {
@@ -881,7 +862,7 @@ export class JobManagerDO {
       manifestKey: checkpoint.manifestKey,
       tickDurationMs: nowMs() - tickStartMs,
       checkpoint: checkpointSummary(checkpoint),
-      event: "chunk.failure.terminal",
+      event: "chunk.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
     const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
@@ -902,6 +883,7 @@ export class JobManagerDO {
       jobId,
       transferId: dbJob.transferId,
       cleanupAtMs,
+      event: "chunk.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
     // Best-effort failure callback
@@ -921,6 +903,68 @@ export class JobManagerDO {
       );
 
     return { status: "FAILED", done: false };
+  }
+
+  private async acquireSemaphore(job: JobStateRow, checkpoint: Checkpoint) {
+    const jobId = job.jobId;
+    const semaphoreId = this.env.ZipSemaphore.idFromName("global");
+    const semaphore = this.env.ZipSemaphore.get(semaphoreId);
+    const desired = toInt(this.env.ZIP_GLOBAL_CONCURRENCY, 1);
+
+    const acquireStartMs = nowMs();
+    const acquiredResp = await semaphore.fetch("https://semaphore/acquire", {
+      method: "POST",
+      body: JSON.stringify({ jobId, limit: desired }),
+    });
+    const acquireDurationMs = nowMs() - acquireStartMs;
+
+    if (!acquiredResp.ok) {
+      const errText = await acquiredResp.text();
+      console.error(`[zip-v2] Failed to acquire semaphore.`, {
+        error: errText,
+        status: acquiredResp.status,
+        durationMs: acquireDurationMs,
+        jobId,
+        transferId: job.transferId,
+        bundleObjectKey: checkpoint.outputKey,
+        manifestKey: checkpoint.manifestKey,
+        event: "lock.unavailable" satisfies ZipV2LifecycleEvent,
+      });
+
+      await this.scheduleNextProgressAction(jobId);
+
+      return false;
+    }
+
+    return true;
+  }
+
+  private async createMultipartUpload(job: JobStateRow, checkpoint: Checkpoint) {
+    const jobId = job.jobId;
+    const createUploadStartMs = nowMs();
+    const upload = await this.env.OUTPUT_BUCKET.createMultipartUpload(checkpoint.outputKey, {
+      customMetadata: {
+        jobId,
+        transferId: job.transferId,
+        manifestKey: checkpoint.manifestKey,
+        zipVersion: ZIP_V2_VERSION,
+      },
+    });
+
+    const createUploadDurationMs = nowMs() - createUploadStartMs;
+    checkpoint.uploadId = upload.uploadId;
+
+    this.upsertCheckpoint(jobId, checkpoint);
+
+    console.log(`[zip-v2] Multipart upload created.`, {
+      jobId,
+      transferId: job.transferId,
+      outputKey: checkpoint.outputKey,
+      uploadId: `${upload.uploadId.slice(0, 8)}...`,
+      durationMs: createUploadDurationMs,
+    });
+
+    return checkpoint;
   }
 
   // Used by the web API to get the job status
@@ -958,9 +1002,9 @@ export class JobManagerDO {
     return this.state.storage.sql as any;
   }
 
-  /** 
+  /**
    * Ensures SQLite schema exists; migrates legacy `nextTickAtMs` / `nextRetryAtMs`
-   * into `nextActionAtMs`. 
+   * into `nextActionAtMs`.
    * */
   private initIfNeeded() {
     const sql = this.sql();
@@ -1055,7 +1099,7 @@ export class JobManagerDO {
     const mins = sql.exec(
       `SELECT MIN(cleanupAtMs) AS nextCleanupAtMs, MIN(nextActionAtMs) AS nextActionAtMs FROM job_state;`,
     );
-    const minRow = (mins.toArray?.() ?? [])[0] as any;
+    const minRow = (mins?.toArray?.() ?? [])[0];
     const nextCleanupAtMs = minRow?.nextCleanupAtMs as number | null | undefined;
     const nextActionAtMs = minRow?.nextActionAtMs as number | null | undefined;
     const candidates = [nextCleanupAtMs, nextActionAtMs].filter(
@@ -1151,7 +1195,7 @@ export class JobManagerDO {
       jobId,
       transferId: fresh.transferId,
       nextActionAtMs,
-      event: "chunkSucceeded",
+      event: "chunk.succeeded" satisfies ZipV2LifecycleEvent,
     });
   }
 
