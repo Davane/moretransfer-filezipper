@@ -96,7 +96,7 @@ new_sqlite_classes = ["JobManagerDO", "ZipSemaphoreDO", "ZipContainerDO"]
 name = "moretransfer-worker-prod"
 
 [[env.prod.containers]]
-max_instances = 2
+max_instances = 3
 class_name = "ZipContainerDO"
 image = "./container/Dockerfile"
 
@@ -161,7 +161,7 @@ MAX_ZIP_BYTES = "68719476736" # 64 GiB
 
 # ZIP v2 (containers)
 ZIP_USE_CONTAINERS = true
-ZIP_GLOBAL_CONCURRENCY = "1"
+ZIP_GLOBAL_CONCURRENCY = "3"
 ZIP_MANIFEST_PREFIX = "manifests"
 ZIP_PART_SIZE_BYTES = "134217728" # 128 MiB
 ZIP_MAX_PARTS_PER_TICK = "8"

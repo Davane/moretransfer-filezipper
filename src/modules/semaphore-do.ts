@@ -8,7 +8,10 @@ function jsonResponse(obj: unknown, status = 200) {
 }
 
 export class ZipSemaphoreDO {
-  constructor(private readonly state: DurableObjectState, private readonly env: Env) {}
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env,
+  ) {}
 
   private sql() {
     return this.state.storage.sql as any;
@@ -34,31 +37,46 @@ export class ZipSemaphoreDO {
       const limit = typeof body.limit === "number" && body.limit > 0 ? body.limit : 1;
 
       const sql = this.sql();
-      // single-statement optimistic acquire
-      sql.exec(
-        `UPDATE tokens SET inUse = inUse + 1 WHERE id = 1 AND inUse < ?;`,
-        limit,
-      );
-      const rs = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
-      const row = rs.one?.();
-      const inUse = Number(row?.inUse ?? 0);
+      // One ZipSemaphore DO instance serializes acquire/release; we can safely read then
+      // increment. The previous optimistic UPDATE-only path incorrectly returned success when
+      // the UPDATE matched no rows at capacity (inUse already == limit).
+      const rsBefore = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
+      const inUseBefore = Number(rsBefore.one?.()?.inUse ?? 0);
 
-      // If we exceeded limit, roll back and deny (rare race; safe).
-      if (inUse > limit) {
-        sql.exec(`UPDATE tokens SET inUse = inUse - 1 WHERE id = 1;`);
-        return jsonResponse({ acquired: false, inUse, limit }, 429);
+      if (inUseBefore >= limit) {
+        return jsonResponse(
+          {
+            acquired: false,
+            inUse: inUseBefore,
+            limit,
+          },
+          429,
+        );
       }
 
-      if (inUse <= limit) {
-        return jsonResponse({ acquired: true, inUse, limit }, 200);
+      sql.exec(`UPDATE tokens SET inUse = inUse + 1 WHERE id = 1;`);
+      const rsAfter = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
+      const inUseAfter = Number(rsAfter.one?.()?.inUse ?? 0);
+
+      if (inUseAfter > limit) {
+        sql.exec(
+          `UPDATE tokens SET inUse = CASE WHEN inUse > 0 THEN inUse - 1 ELSE 0 END WHERE id = 1;`,
+        );
+        const rsRb = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
+        return jsonResponse(
+          { acquired: false, inUse: Number(rsRb.one?.()?.inUse ?? 0), limit },
+          429,
+        );
       }
-  
-      return jsonResponse({ acquired: false, inUse, limit }, 429);
+
+      return jsonResponse({ acquired: true, inUse: inUseAfter, limit }, 200);
     }
 
     if (req.method === "POST" && url.pathname === "/release") {
       const sql = this.sql();
-      sql.exec(`UPDATE tokens SET inUse = CASE WHEN inUse > 0 THEN inUse - 1 ELSE 0 END WHERE id = 1;`);
+      sql.exec(
+        `UPDATE tokens SET inUse = CASE WHEN inUse > 0 THEN inUse - 1 ELSE 0 END WHERE id = 1;`,
+      );
       const rs = sql.exec(`SELECT inUse FROM tokens WHERE id = 1;`);
       const row = rs.one?.();
 
@@ -75,4 +93,3 @@ export class ZipSemaphoreDO {
     return new Response("not found", { status: 404 });
   }
 }
-

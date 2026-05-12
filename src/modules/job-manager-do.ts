@@ -916,12 +916,21 @@ export class JobManagerDO {
       method: "POST",
       body: JSON.stringify({ jobId, limit: desired }),
     });
-    const acquireDurationMs = nowMs() - acquireStartMs;
 
-    if (!acquiredResp.ok) {
-      const errText = await acquiredResp.text();
+    const raw = await acquiredResp.text();
+    let parsed: { acquired?: boolean } | null = null;
+
+    try {
+      parsed = JSON.parse(raw) as { acquired?: boolean };
+    } catch {
+      // leave parsed null
+    }
+
+    const acquired = acquiredResp.ok && parsed?.acquired === true;
+    if (!acquired) {
+      const acquireDurationMs = nowMs() - acquireStartMs;
       console.error(`[zip-v2] Failed to acquire semaphore.`, {
-        error: errText,
+        error: raw.slice(0, 500),
         status: acquiredResp.status,
         durationMs: acquireDurationMs,
         jobId,
