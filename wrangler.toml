@@ -56,7 +56,7 @@ class_name = "ZipContainerDO"
 # Vars
 [env.dev.vars]
 # http://localhost:3000
-WEB_API_BASE_URL = "https://d9ee-208-131-169-242.ngrok-free.app" 
+WEB_API_BASE_URL = "https://cce5-2605-a200-3000-6a1e-2184-3c74-7271-c5f2.ngrok-free.app" 
 ZIP_OUTPUT_PREFIX = "bundle"
 ZIP_OUTPUT_FILE_NAME = "moretransfer_bundle_dev"
 MAX_FILES = "500"
