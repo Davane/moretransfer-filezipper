@@ -536,7 +536,6 @@ export class JobManagerDO {
             });
             return { status: "FINALIZING", done: false };
           }
-
         } catch (error) {
           await this.failFinalizeJob(
             {

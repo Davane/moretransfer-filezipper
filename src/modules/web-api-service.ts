@@ -1,7 +1,10 @@
 import { COMPANY_NAME } from "../lib/constants";
 import { createHmacSha256Hex } from "../lib/crypto";
 import { TransferUpdateRequest } from "../lib/types/types";
-import { createSafeUploadKey, fetchWithCredentials, slugify } from "../lib/utils";
+import { createSafeUploadKey, fetchWithCredentials, runWithRetries, slugify } from "../lib/utils";
+
+const STATUS_RETRY_ATTEMPTS = 7;
+const STATUS_RETRY_BASE_DELAY_MS = 2000;
 
 export enum NextApiErrorCode {
   TransferSessionException = "TransferSessionException",
@@ -38,22 +41,34 @@ class WebAPIService {
     };
   }
 
-  async updateTransferStatus(transferId: string, request: TransferUpdateRequest) {
-    const headers = await this.getHeaderSignature(request);
+  async updateTransferStatus(
+    transferId: string,
+    request: TransferUpdateRequest,
+    options?: { retry?: boolean },
+  ) {
     const url = `${this._baseUrl}/api/transfers/${transferId}/compression-status`;
-    console.log(`Updating transfer status for ${transferId}:`, url, JSON.stringify(request));
+    const maxAttempts = (options?.retry ?? true) ? STATUS_RETRY_ATTEMPTS : 1;
 
-    try {
-      const uploadMeta = await fetchWithCredentials<any>(url, {
-        method: "PUT",
-        body: JSON.stringify(request),
-        headers,
-      });
-      return uploadMeta;
-    } catch (error: any) {
-      console.log(`Error updating transfer status for ${transferId}:`, error);
-      throw error;
-    }
+    return runWithRetries(
+      async () => {
+        console.log(`Updating transfer status for ${transferId}:`, url, JSON.stringify(request));
+        const headers = await this.getHeaderSignature(request);
+        return fetchWithCredentials<any>(url, {
+          method: "PUT",
+          body: JSON.stringify(request),
+          headers,
+        });
+      },
+      {
+        maxAttempts,
+        baseDelayMs: STATUS_RETRY_BASE_DELAY_MS,
+        onFailure: (error, attempt, attempts) =>
+          console.log(
+            `Error updating transfer status for ${transferId} (attempt ${attempt}/${attempts}):`,
+            error,
+          ),
+      },
+    );
   }
 
   async sendCleanupExpiredTransfersRequest(body: Record<string, any>) {

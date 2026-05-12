@@ -36,6 +36,43 @@ export async function fetchWithCredentials<T>(endpoint: string, options: Request
   return res.json() as T;
 }
 
+export type RunWithRetriesOptions = {
+  maxAttempts: number;
+  /** Delay before the next attempt after failure `n` (0-based): `baseDelayMs * (n + 1)`. */
+  baseDelayMs: number;
+  /** Called after each failure, before sleeping (not called on the final failure). */
+  onFailure?: (error: unknown, attempt: number, maxAttempts: number) => void;
+};
+
+/**
+ * Runs `fn` until it succeeds or `maxAttempts` is exhausted.
+ * Uses linear backoff between attempts: `baseDelayMs * (attemptIndex + 1)`.
+ */
+export async function runWithRetries<T>(fn: () => Promise<T>, options: RunWithRetriesOptions): Promise<T> {
+  const { maxAttempts, baseDelayMs, onFailure } = options;
+  if (maxAttempts < 1) {
+    throw new Error("runWithRetries: maxAttempts must be at least 1");
+  }
+  
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error: unknown) {
+      lastError = error;
+      const oneBased = attempt + 1;
+      onFailure?.(error, oneBased, maxAttempts);
+      if (attempt < maxAttempts - 1) {
+        const delayMs = baseDelayMs * (attempt + 1);
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
 export function calculateExponentialBackoff(attempts: number, baseDelaySeconds: number) {
   return baseDelaySeconds ** attempts;
 }
