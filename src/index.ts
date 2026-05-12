@@ -3,6 +3,7 @@ import {
   QueueMessage,
   QueueMessageType,
   RequestPath,
+  TransferStatus,
   ZipJob,
   ZipV2LifecycleEvent,
   ZipV2TickMessage,
@@ -91,6 +92,23 @@ export default {
               outputKey,
               outputBytes: existingOut.size,
             });
+
+            // Notify the Web API that the job is done
+            const webAPIService = new WebAPIService(env.SECRET_KEY, env.WEB_API_BASE_URL);
+            try {
+              await webAPIService.updateTransferStatus(job.transferId, {
+                status: TransferStatus.READY,
+                bundleObjectKey: outputKey,
+              });
+            } catch (e) {
+              console.warn(`[zip-v2] Failed to reconcile transfer status (output exists path)`, {
+                error: e,
+                jobId,
+                transferId: job.transferId,
+                outputKey,
+              });
+            }
+
             return new Response("Enqueued", { status: 202 });
           }
 

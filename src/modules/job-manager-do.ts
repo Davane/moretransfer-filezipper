@@ -4,6 +4,7 @@ import { MissingMultipartPartsError, ContainerRunError } from "../lib/errors";
 import {
   Env,
   TransferStatus,
+  TransferUpdateRequest,
   Checkpoint,
   ErrorKind,
   JobStatus,
@@ -25,6 +26,8 @@ import {
   computeBackoffSeconds,
   jitterMs,
   classifyContainerFailure,
+  optionalTriStateBoolFromSql,
+  sqlIntegerFromOptionalTriStateBool,
 } from "../lib/utils";
 import {
   DEFAULT_PART_SIZE,
@@ -235,6 +238,52 @@ export class JobManagerDO {
   // --------------------------------------------------------------------------------
 
   /**
+   * PUT compression status to the Web API and persist `isTransferStatusUpdated` on `job_state`.
+   * Idempotent retries are handled inside `WebAPIService.updateTransferStatus`.
+   */
+  private async persistTransferStatusNotify(job: JobStateRow, request: TransferUpdateRequest) {
+    const jobId = job.jobId;
+    const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
+
+    console.log(`[zip-v2] Persisting transfer status notify.`, {
+      jobId,
+      transferId: job.transferId,
+      request: JSON.stringify(request),
+    });
+
+    try {
+      await webAPIService.updateTransferStatus(job.transferId, request);
+      const fresh = this.getJobRow(jobId);
+
+      if (!fresh) {
+        throw new Error(`Job not found after update transfer status: ${jobId}`);
+      }
+
+      this.upsertJob({
+        ...fresh,
+        isTransferStatusUpdated: true,
+        updatedAtMs: nowMs(),
+      });
+    } catch (e) {
+      const fresh = this.getJobRow(jobId);
+      if (fresh) {
+        this.upsertJob({
+          ...fresh,
+          isTransferStatusUpdated: false,
+          updatedAtMs: nowMs(),
+        });
+      }
+
+      console.warn(`[zip-v2] Failed to update transfer status`, {
+        error: e,
+        jobId,
+        transferId: job.transferId,
+        request: JSON.stringify(request),
+      });
+    }
+  }
+
+  /**
    * Idempotent: creates `PENDING` row + checkpoint and schedules first tick via `nextActionAtMs`.
    *
    * @param body - The start job request body
@@ -251,6 +300,15 @@ export class JobManagerDO {
         outputKey,
         existing: existing?.status,
       });
+
+      if (existing.status === "DONE" && existing.isTransferStatusUpdated !== true) {
+        const cp = this.getCheckpoint(jobId);
+        await this.persistTransferStatusNotify(existing, {
+          status: TransferStatus.READY,
+          bundleObjectKey: cp?.outputKey ?? outputKey,
+        });
+      }
+
       return;
     }
 
@@ -350,6 +408,16 @@ export class JobManagerDO {
 
         const { outputBytes, verifyDurationMs } = await this.verifyFinalOutput(checkpoint);
         await this.scheduleCleanup({ ...job, status: "DONE" });
+
+        // Notify the Web API that the job is done
+        const doneAfterFinalize = this.getJobRow(jobId);
+        if (doneAfterFinalize) {
+          await this.persistTransferStatusNotify(doneAfterFinalize, {
+            status: TransferStatus.READY,
+            bundleObjectKey: checkpoint.outputKey,
+          });
+        }
+
         console.log(`[zip-v2] Tick done (job complete).`, {
           jobId,
           transferId: job.transferId,
@@ -381,6 +449,25 @@ export class JobManagerDO {
         jobId,
         jobStatus: job.status,
       });
+
+      // Notify the Web API that the job is done
+      if (job.status === "DONE" && job.isTransferStatusUpdated !== true) {
+        const cp = this.getCheckpoint(jobId);
+        if (cp?.outputKey) {
+          await this.persistTransferStatusNotify(job, {
+            status: TransferStatus.READY,
+            bundleObjectKey: cp.outputKey,
+          });
+        }
+      }
+
+      // Notify the Web API that the job failed
+      if (job.status === "FAILED" && job.isTransferStatusUpdated !== true) {
+        await this.persistTransferStatusNotify(job, {
+          status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+        });
+      }
+
       return {
         status: job.status,
         done: job.status === "DONE",
@@ -401,6 +488,13 @@ export class JobManagerDO {
         nextActionAtMs: undefined,
       });
       await this.rescheduleStorageAlarmFromDb();
+
+      // Notify the Web API that the job is done
+      const doneJob = this.getJobRow(jobId) ?? { ...job, status: "DONE" as const };
+      await this.persistTransferStatusNotify(doneJob, {
+        status: TransferStatus.READY,
+        bundleObjectKey: checkpoint.outputKey,
+      });
 
       return { status: "DONE", done: true };
     }
@@ -554,23 +648,11 @@ export class JobManagerDO {
         // Schedule cleanup after successful verification
         await this.scheduleCleanup({ ...job, status: "DONE" });
 
-        // Best-effort status callback
-        const transferIdForNotify = job.transferId;
-        const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
-        await webAPIService
-          .updateTransferStatus(transferIdForNotify, {
-            status: TransferStatus.READY,
-            bundleObjectKey: checkpoint.outputKey,
-          })
-          .catch((e) =>
-            console.warn(`[zip-v2] Failed to update transfer status`, {
-              error: e,
-              jobId,
-              transferId: transferIdForNotify,
-              bundleObjectKey: checkpoint.outputKey,
-              manifestKey: checkpoint.manifestKey,
-            }),
-          );
+        const doneAfterCleanup = this.getJobRow(jobId) ?? job;
+        await this.persistTransferStatusNotify(doneAfterCleanup, {
+          status: TransferStatus.READY,
+          bundleObjectKey: checkpoint.outputKey,
+        });
 
         console.log(`[zip-v2] Tick done (job complete).`, {
           jobId,
@@ -712,20 +794,10 @@ export class JobManagerDO {
       event: "finalize.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
-    const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
-    await webAPIService
-      .updateTransferStatus(fresh.transferId, {
-        status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
-      })
-      .catch((e) =>
-        console.warn(`[zip-v2] Failed to update transfer status`, {
-          error: e,
-          jobId,
-          transferId: fresh.transferId,
-          bundleObjectKey: checkpoint.outputKey,
-          manifestKey: checkpoint.manifestKey,
-        }),
-      );
+    const failedRow = this.getJobRow(jobId) ?? fresh;
+    await this.persistTransferStatusNotify(failedRow, {
+      status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+    });
   }
 
   /**
@@ -912,21 +984,10 @@ export class JobManagerDO {
       event: "chunk.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
-    // Best-effort failure callback
-    const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
-    await webAPIService
-      .updateTransferStatus(dbJob.transferId, {
-        status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
-      })
-      .catch((e) =>
-        console.warn(`[zip-v2] Failed to update transfer status`, {
-          error: e,
-          jobId,
-          transferId: dbJob.transferId,
-          bundleObjectKey: checkpoint.outputKey,
-          manifestKey: checkpoint.manifestKey,
-        }),
-      );
+    const failedRow = this.getJobRow(jobId) ?? dbJob;
+    await this.persistTransferStatusNotify(failedRow, {
+      status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+    });
 
     return { status: "FAILED", done: false };
   }
@@ -1071,6 +1132,7 @@ export class JobManagerDO {
       `ALTER TABLE job_state ADD COLUMN cleanupAtMs INTEGER;`,
       `ALTER TABLE job_state ADD COLUMN nextTickAtMs INTEGER;`,
       `ALTER TABLE job_state ADD COLUMN nextActionAtMs INTEGER;`,
+      `ALTER TABLE job_state ADD COLUMN isTransferStatusUpdated INTEGER;`,
     ]) {
       try {
         sql.exec(stmt);
@@ -1238,7 +1300,8 @@ export class JobManagerDO {
     const sql = this.sql();
     const rs = sql.exec(
       `SELECT jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage,
-              consecutiveFailures, lastFailureAtMs, nextRetryAtMs, lastErrorKind, cleanupAtMs, nextTickAtMs, nextActionAtMs
+              consecutiveFailures, lastFailureAtMs, nextRetryAtMs, lastErrorKind, cleanupAtMs, nextTickAtMs, nextActionAtMs,
+              isTransferStatusUpdated
        FROM job_state WHERE jobId = ?;`,
       jobId,
     );
@@ -1251,6 +1314,8 @@ export class JobManagerDO {
     const r: any = row;
     // Prefer `nextActionAtMs`; fall back to legacy columns until migration UPDATE has run.
     const effectiveNextAction = r.nextActionAtMs ?? r.nextTickAtMs ?? r.nextRetryAtMs;
+    const isTransferStatusUpdated = optionalTriStateBoolFromSql(r.isTransferStatusUpdated);
+
     return {
       jobId: r.jobId,
       transferId: r.transferId,
@@ -1263,6 +1328,7 @@ export class JobManagerDO {
       nextActionAtMs: effectiveNextAction ?? undefined,
       lastErrorKind: (r.lastErrorKind ?? undefined) as any,
       cleanupAtMs: r.cleanupAtMs ?? undefined,
+      isTransferStatusUpdated,
     } satisfies JobStateRow;
   }
 
@@ -1309,13 +1375,15 @@ export class JobManagerDO {
 
   private upsertJob(row: JobStateRow) {
     const sql = this.sql();
+    const notifySql = sqlIntegerFromOptionalTriStateBool(row.isTransferStatusUpdated);
     // Always null legacy wake columns so reads prefer `nextActionAtMs` after migration.
     sql.exec(
       `INSERT INTO job_state (
          jobId, transferId, status, createdAtMs, updatedAtMs, errorMessage,
-         consecutiveFailures, lastFailureAtMs, nextRetryAtMs, lastErrorKind, cleanupAtMs, nextTickAtMs, nextActionAtMs
+         consecutiveFailures, lastFailureAtMs, nextRetryAtMs, lastErrorKind, cleanupAtMs, nextTickAtMs, nextActionAtMs,
+         isTransferStatusUpdated
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(jobId) DO UPDATE SET
          transferId=excluded.transferId,
          status=excluded.status,
@@ -1327,7 +1395,8 @@ export class JobManagerDO {
          lastErrorKind=excluded.lastErrorKind,
          cleanupAtMs=excluded.cleanupAtMs,
          nextTickAtMs=NULL,
-         nextActionAtMs=excluded.nextActionAtMs;`,
+         nextActionAtMs=excluded.nextActionAtMs,
+         isTransferStatusUpdated=excluded.isTransferStatusUpdated;`,
       row.jobId,
       row.transferId,
       row.status,
@@ -1341,6 +1410,7 @@ export class JobManagerDO {
       row.cleanupAtMs ?? null,
       null,
       row.nextActionAtMs ?? null,
+      notifySql,
     );
   }
 

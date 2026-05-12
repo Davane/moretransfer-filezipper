@@ -73,6 +73,36 @@ export async function runWithRetries<T>(fn: () => Promise<T>, options: RunWithRe
   throw lastError;
 }
 
+/**
+ * Maps a SQLite INTEGER (or occasional boolean from the driver) to `boolean | undefined`
+ * for **tri-state** columns such as `job_state.isTransferStatusUpdated`.
+ *
+ * - `1` or `true` → explicit success.
+ * - `0` or `false` → explicit failure / negative.
+ * - `NULL`, `undefined`, or anything else → **unknown / never set** (must not become `false`).
+ *
+ * Do not replace this with `Boolean(value)`: `Boolean(null)` is `false` and would make
+ * “never recorded” indistinguishable from “notify failed,” breaking reconcile logic.
+ */
+export function optionalTriStateBoolFromSql(value: unknown): boolean | undefined {
+  if (value === 1 || value === true) return true;
+  if (value === 0 || value === false) return false;
+  return undefined;
+}
+
+/**
+ * Maps `boolean | undefined` to SQLite INTEGER for tri-state columns (`NULL` / `0` / `1`).
+ *
+ * - `true` → `1`
+ * - `false` → `0`
+ * - `undefined` → `NULL` (field omitted on the row; do not persist a bogus `0`)
+ */
+export function sqlIntegerFromOptionalTriStateBool(value: boolean | undefined): number | null {
+  if (value === true) return 1;
+  if (value === false) return 0;
+  return null;
+}
+
 export function calculateExponentialBackoff(attempts: number, baseDelaySeconds: number) {
   return baseDelaySeconds ** attempts;
 }

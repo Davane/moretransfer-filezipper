@@ -251,6 +251,8 @@ export type JobStateRow = {
   nextActionAtMs?: number;
   lastErrorKind?: ErrorKind;
   cleanupAtMs?: number;
+  /** Whether the Web API accepted the last compression-status PUT for this job. */
+  isTransferStatusUpdated?: boolean;
 };
 
 export type StartJobRequest = {
