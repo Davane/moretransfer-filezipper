@@ -70,6 +70,7 @@ ZIP_GLOBAL_CONCURRENCY = "1"
 ZIP_MANIFEST_PREFIX = "manifests"
 ZIP_PART_SIZE_BYTES = "134217728" # 128 MiB
 ZIP_MAX_PARTS_PER_TICK = "8"
+BUNDLE_CLEANUP_TTL_DAYS = 1
 
 # Secret used in the API
 # SECRET_KEY = ""
@@ -165,6 +166,7 @@ ZIP_GLOBAL_CONCURRENCY = "3"
 ZIP_MANIFEST_PREFIX = "manifests"
 ZIP_PART_SIZE_BYTES = "134217728" # 128 MiB
 ZIP_MAX_PARTS_PER_TICK = "8"
+BUNDLE_CLEANUP_TTL_DAYS = 3  # days
 
 # Requires signing to preview videos from Cloudflare Stream 
 # (set to false to allow public playback during ingest)

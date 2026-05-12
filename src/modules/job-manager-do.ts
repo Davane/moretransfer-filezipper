@@ -32,7 +32,7 @@ import {
   DEFAULT_NUMBER_OF_PARTS,
   DEFAULT_MAX_CONSECUTIVE_FAILURES,
   DEFAULT_RETRY_BASE_DELAY_SECONDS,
-  CLEANUP_TTL_MS,
+  DEFAULT_BUNDLE_CLEANUP_TTL_DAYS,
   DEFAULT_TICK_INTERVAL_MS,
 } from "../lib/constants";
 
@@ -336,7 +336,7 @@ export class JobManagerDO {
     // If we were in FINALIZING, skip runChunk and attempt multipart completion.
     if (job.status === "FINALIZING") {
       try {
-        const finalized = await this.finalizeMultipartIfNeeded(jobId, job, checkpoint);
+        const finalized = await this.finalizeMultipartIfNeeded(job, checkpoint);
         if (!finalized) {
           // `finalizeMultipartIfNeeded` already ran `applyRetryableBackoff` + `rescheduleStorageAlarmFromDb`.
           console.log(`[zip-v2] Finalization deferred (alarm/backoff already scheduled).`, {
@@ -349,7 +349,7 @@ export class JobManagerDO {
         }
 
         const { outputBytes, verifyDurationMs } = await this.verifyFinalOutput(checkpoint);
-        await this.scheduleCleanup(jobId, { ...job, status: "DONE" });
+        await this.scheduleCleanup({ ...job, status: "DONE" });
         console.log(`[zip-v2] Tick done (job complete).`, {
           jobId,
           transferId: job.transferId,
@@ -362,7 +362,7 @@ export class JobManagerDO {
 
         return { status: "DONE", done: true };
       } catch (e) {
-        await this.failFinalizeJob(jobId, job, checkpoint, e);
+        await this.failFinalizeJob(job, checkpoint, e);
         return { status: "FAILED", done: false };
       }
     }
@@ -517,14 +517,17 @@ export class JobManagerDO {
       job = refreshedAfterCp;
 
       if (run.done) {
-        // Finalization stage: complete multipart using the full persisted parts list.
+        // Finalization stage - complete multipart using the full persisted parts list.
         this.upsertJob({ ...job, status: "FINALIZING", updatedAtMs: nowMs() });
         try {
           const finalized = await this.finalizeMultipartIfNeeded(
-            jobId,
-            { ...job, status: "FINALIZING" },
+            {
+              ...job,
+              status: "FINALIZING",
+            },
             checkpoint,
           );
+
           if (!finalized) {
             console.log(`[zip-v2] Finalization deferred (alarm/backoff already scheduled).`, {
               jobId,
@@ -533,8 +536,16 @@ export class JobManagerDO {
             });
             return { status: "FINALIZING", done: false };
           }
-        } catch (e) {
-          await this.failFinalizeJob(jobId, { ...job, status: "FINALIZING" }, checkpoint, e);
+
+        } catch (error) {
+          await this.failFinalizeJob(
+            {
+              ...job,
+              status: "FINALIZING",
+            },
+            checkpoint,
+            error,
+          );
           return { status: "FAILED", done: false };
         }
 
@@ -542,7 +553,7 @@ export class JobManagerDO {
         const { outputBytes, verifyDurationMs } = await this.verifyFinalOutput(checkpoint);
 
         // Schedule cleanup after successful verification
-        await this.scheduleCleanup(jobId, { ...job, status: "DONE" });
+        await this.scheduleCleanup({ ...job, status: "DONE" });
 
         // Best-effort status callback
         const transferIdForNotify = job.transferId;
@@ -602,12 +613,29 @@ export class JobManagerDO {
     }
   }
 
+  private getBundleCleanupTtlMs(jobId: string) {
+    const bundleCleanupTtlDays = toInt(
+      this.env.BUNDLE_CLEANUP_TTL_DAYS,
+      DEFAULT_BUNDLE_CLEANUP_TTL_DAYS,
+    );
+    const bundleCleanupTtlMs = bundleCleanupTtlDays * 24 * 60 * 60 * 1000;
+    const cleanupAtMs = nowMs() + bundleCleanupTtlMs;
+
+    console.log(`[zip-v2] Bundle cleanup TTL: ${bundleCleanupTtlDays} days`, {
+      jobId,
+      bundleCleanupTtlDays,
+      bundleCleanupTtlMs,
+      cleanupAtMs,
+    });
+
+    return cleanupAtMs;
+  }
   /**
-   * Marks job `DONE` and schedules row purge after `CLEANUP_TTL_MS`.
+   * Marks job `DONE` and schedules row purge after `CLEANUP_TTL_DAYS`.
    * Clears any pending chunk wake.
    */
-  private async scheduleCleanup(jobId: string, job: JobStateRow) {
-    const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
+  private async scheduleCleanup(job: JobStateRow) {
+    const cleanupAtMs = this.getBundleCleanupTtlMs(job.jobId);
 
     this.upsertJob({
       ...job,
@@ -620,7 +648,7 @@ export class JobManagerDO {
     await this.rescheduleStorageAlarmFromDb();
 
     console.log(`[zip-v2] Cleanup scheduled (done).`, {
-      jobId,
+      jobId: job.jobId,
       transferId: job.transferId,
       cleanupAtMs,
       event: "output.verified" satisfies ZipV2LifecycleEvent,
@@ -649,14 +677,10 @@ export class JobManagerDO {
    * Terminal failure during FINALIZING: non-retryable error, missing parts, or retry
    * budget exhausted. Clears `nextActionAtMs`, schedules cleanup TTL, notifies web API (best-effort).
    */
-  private async failFinalizeJob(
-    jobId: string,
-    job: JobStateRow,
-    checkpoint: Checkpoint,
-    err: unknown,
-  ) {
+  private async failFinalizeJob(job: JobStateRow, checkpoint: Checkpoint, err: unknown) {
     const rawErrText = String((err as any)?.message ?? err);
-    const fresh = this.getJobRow(jobId) ?? job;
+    const fresh = this.getJobRow(job.jobId) ?? job;
+    const jobId = fresh.jobId;
 
     console.error(`[zip-v2] Finalization permanently failed jobId=${jobId}`, {
       error: err,
@@ -669,7 +693,7 @@ export class JobManagerDO {
       event: "finalize.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
-    const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
+    const cleanupAtMs = this.getBundleCleanupTtlMs(jobId);
     this.upsertJob({
       ...fresh,
       status: "FAILED",
@@ -709,10 +733,13 @@ export class JobManagerDO {
    * Completes the R2 multipart upload when all parts are persisted. Returns `false` when
    * completion failed with a retryable error — `applyRetryableBackoff` was already applied.
    * Throws on non-retryable errors or when retry budget is exhausted (caller marks `FAILED`).
+   *
+   *  Idempotency: if output already exists, consider it finalized.
    */
-  private async finalizeMultipartIfNeeded(jobId: string, job: JobStateRow, checkpoint: Checkpoint) {
-    // Idempotency: if output already exists, consider it finalized.
+  private async finalizeMultipartIfNeeded(job: JobStateRow, checkpoint: Checkpoint) {
+    const jobId = job.jobId;
     const existing = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
+
     if (existing) {
       console.log(`[zip-v2] Finalization skipped (output exists).`, {
         jobId,
@@ -865,7 +892,7 @@ export class JobManagerDO {
       event: "chunk.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
-    const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
+    const cleanupAtMs = this.getBundleCleanupTtlMs(jobId);
     this.upsertJob({
       ...dbJob,
       status: "FAILED",

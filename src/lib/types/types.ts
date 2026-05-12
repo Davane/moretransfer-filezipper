@@ -22,11 +22,12 @@ export interface Env {
   SKIP_REQUEST_VERIFICATION: boolean | undefined;
 
   // ZIP v2 (containers)
-  ZIP_USE_CONTAINERS?: boolean | undefined;
-  ZIP_GLOBAL_CONCURRENCY?: string | undefined; // default 1
-  ZIP_MANIFEST_PREFIX?: string | undefined; // default "manifests"
-  ZIP_PART_SIZE_BYTES?: string | undefined; // default 134217728 (128 MiB)
-  ZIP_MAX_PARTS_PER_TICK?: string | undefined; // default 8
+  ZIP_USE_CONTAINERS: boolean | undefined;
+  ZIP_GLOBAL_CONCURRENCY: string | undefined; // default 1
+  ZIP_MANIFEST_PREFIX: string | undefined; // default "manifests"
+  ZIP_PART_SIZE_BYTES: string | undefined; // default 134217728 (128 MiB)
+  ZIP_MAX_PARTS_PER_TICK: string | undefined; // default 8
+  BUNDLE_CLEANUP_TTL_DAYS: number | undefined;
 
   // Cloudflare Stream
   CLOUDFLARE_ACCOUNT_ID: string;
