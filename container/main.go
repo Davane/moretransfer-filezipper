@@ -11,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -315,12 +314,10 @@ func handleRunChunk(w http.ResponseWriter, r *http.Request) {
 
 		// Flush final part and complete multipart
 		// Note: final part may be smaller than PartSize; multipart APIs allow that.
-		uploaded, err := uploader.FlushFinal()
-		if err != nil {
+		if _, err := uploader.FlushFinal(); err != nil {
 			http.Error(w, "flush final failed: "+err.Error(), 500)
 			return
 		}
-		_ = uploaded
 		// Multipart completion is performed by the coordinator (JobManagerDO), which has
 		// the full ordered list of uploaded parts across all /runChunk calls.
 	} else {
@@ -464,11 +461,6 @@ func (u *MultipartUploader) FlushFinal() (UploadedPart, error) {
 	return up, nil
 }
 
-// AllParts returns the parts uploaded so far (used to complete multipart uploads).
-func (u *MultipartUploader) AllParts() []UploadedPart {
-	return u.UploadedParts
-}
-
 // ---------------- Outbound helper calls ----------------
 
 // fetchManifest loads the zip job manifest from output storage.
@@ -525,24 +517,6 @@ func uploadPart(ctx context.Context, key, uploadId string, partNumber int, body 
 	sizeStr := res.Header.Get("x-size-bytes")
 	size, _ := strconv.Atoi(sizeStr)
 	return etag, size, nil
-}
-
-// completeMultipart finalizes the multipart upload by sending the full ordered part list.
-func completeMultipart(ctx context.Context, key, uploadId string, parts []UploadedPart) error {
-	u := fmt.Sprintf("http://output.r2/complete?key=%s&uploadId=%s", url.QueryEscape(key), url.QueryEscape(uploadId))
-	body, _ := json.Marshal(parts)
-	req, _ := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
-	req.Header.Set("content-type", "application/json")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		b, _ := io.ReadAll(res.Body)
-		return fmt.Errorf("status %d: %s", res.StatusCode, string(b))
-	}
-	return nil
 }
 
 // fetchEntries retrieves previously persisted central directory entries from the JobManager DO.
@@ -744,31 +718,3 @@ func writeEndOfCentralDirectory(w *MultipartUploader, n int) error {
 	b.Write(u16(0))
 	return w.Write(b.Bytes())
 }
-
-// Silence unused imports in early iterations.
-//
-// This container file has been iterated on quickly and sometimes shares snippets with
-// other implementations; keeping these avoids churn while stabilizing the build.
-var _ = os.Getenv
-var _ = strings.Builder{}
-var _ = url.Values{}
-var _ = bytes.MinRead
-var _ = fmt.Sprintf
-var _ = log.Printf
-var _ = context.Canceled
-var _ = io.Discard
-var _ = time.Second
-var _ = crc32.IEEETable
-var _ = base64.StdEncoding
-var _ = strconv.IntSize
-var _ = url.PathEscape
-var _ = strings.Contains
-var _ = http.MethodGet
-var _ = bytes.NewBuffer
-var _ = bytes.NewReader
-var _ = strings.NewReader
-var _ = url.QueryEscape
-var _ = json.RawMessage{}
-var _ = bytes.Compare
-var _ = strings.EqualFold
-
