@@ -22,9 +22,8 @@ import {
   jsonResponse,
   checkpointSummary,
   classifyFinalizeFailure,
-  computeBackoffSeconds,
-  jitterMs,
   classifyContainerFailure,
+  jitterMs,
 } from "../lib/utils";
 import {
   DEFAULT_PART_SIZE,
@@ -35,6 +34,13 @@ import {
   CLEANUP_TTL_MS,
   DEFAULT_TICK_INTERVAL_MS,
 } from "../lib/constants";
+import {
+  lookupZipTransition,
+  type ZipEffect,
+  type ZipTableEvent,
+  type ZipTransitionClockConfig,
+  type ZipTickState,
+} from "./zip-v2-transitions";
 
 async function clearAlarmIfSupported(storage: DurableObjectStorage) {
   // deleteAlarm exists in newer runtime APIs; keep best-effort compatibility.
@@ -322,11 +328,12 @@ export class JobManagerDO {
   private async handleTick(jobId: string): Promise<TickJobResponse> {
     const tickStartMs = nowMs();
     let job = this.getJobRow(jobId);
-    const checkpoint = this.getCheckpoint(jobId);
+    const checkpointRow = this.getCheckpoint(jobId);
 
-    if (!job || !checkpoint) {
+    if (!job || !checkpointRow) {
       throw new Error(`No Job or Checkpoint found for job: ${jobId}`);
     }
+    let checkpoint: Checkpoint = checkpointRow;
 
     const backoffResponse = this.maybeReturnBackoffTickResponse(job);
     if (backoffResponse) {
@@ -394,13 +401,17 @@ export class JobManagerDO {
 
     const existingOut = await this.env.OUTPUT_BUCKET.head(checkpoint.outputKey);
     if (existingOut) {
-      this.upsertJob({
-        ...job,
-        status: "DONE",
-        updatedAtMs: nowMs(),
-        nextActionAtMs: undefined,
-      });
-      await this.rescheduleStorageAlarmFromDb();
+      const clock = this.buildZipTransitionClockConfig();
+      const resolved = lookupZipTransition(
+        { job, checkpoint } satisfies ZipTickState,
+        job.status,
+        { type: "output_exists" } satisfies ZipTableEvent,
+        clock,
+      );
+      if (resolved.kind !== "effects") {
+        throw new Error(`[zip-v2] unexpected transition result for output_exists: ${resolved.kind}`);
+      }
+      await this.executeZipEffects(resolved.effects);
 
       return { status: "DONE", done: true };
     }
@@ -484,47 +495,26 @@ export class JobManagerDO {
           : "chunk.succeeded") satisfies ZipV2LifecycleEvent,
       });
 
-      if (job.consecutiveFailures > 0 || job.nextActionAtMs || job.lastErrorKind) {
-        this.upsertJob({
-          ...job,
-          consecutiveFailures: 0,
-          nextActionAtMs: undefined,
-          lastFailureAtMs: undefined,
-          lastErrorKind: undefined,
-          updatedAtMs: nowMs(),
-        });
-        job = this.getJobRow(jobId) ?? job;
+      const freshJob = this.getJobRow(jobId) ?? job;
+      const cpState = this.getCheckpoint(jobId) ?? checkpoint;
+      const clock = this.buildZipTransitionClockConfig();
+      const chunkResolved = lookupZipTransition(
+        { job: freshJob, checkpoint: cpState } satisfies ZipTickState,
+        freshJob.status,
+        { type: "chunk_run_success", run } satisfies ZipTableEvent,
+        clock,
+      );
+      if (chunkResolved.kind !== "effects") {
+        throw new Error(`[zip-v2] unexpected transition for chunk_run_success: ${chunkResolved.kind}`);
       }
-
-      if (run.uploadedParts?.length) {
-        this.insertUploadedParts(jobId, run.uploadedParts);
-      }
-
-      this.upsertCheckpoint(jobId, {
-        ...checkpoint,
-        nextPartNumber: run.nextPartNumber,
-        fileIndex: run.fileIndex,
-        zipOffset: run.zipOffset,
-        bytesWrittenTotal: run.bytesWrittenTotal,
-        filesDone: run.filesDone,
-        done: run.done,
-      } satisfies Checkpoint);
-
-      const refreshedAfterCp = this.getJobRow(jobId);
-      if (!refreshedAfterCp) {
-        throw new Error(`Job row missing after checkpoint update jobId=${jobId}`);
-      }
-      job = refreshedAfterCp;
+      await this.executeZipEffects(chunkResolved.effects);
+      job = this.getJobRow(jobId) ?? freshJob;
+      checkpoint = this.getCheckpoint(jobId) ?? cpState;
 
       if (run.done) {
         // Finalization stage: complete multipart using the full persisted parts list.
-        this.upsertJob({ ...job, status: "FINALIZING", updatedAtMs: nowMs() });
         try {
-          const finalized = await this.finalizeMultipartIfNeeded(
-            jobId,
-            { ...job, status: "FINALIZING" },
-            checkpoint,
-          );
+          const finalized = await this.finalizeMultipartIfNeeded(jobId, job, checkpoint);
           if (!finalized) {
             console.log(`[zip-v2] Finalization deferred (alarm/backoff already scheduled).`, {
               jobId,
@@ -534,7 +524,7 @@ export class JobManagerDO {
             return { status: "FINALIZING", done: false };
           }
         } catch (e) {
-          await this.failFinalizeJob(jobId, { ...job, status: "FINALIZING" }, checkpoint, e);
+          await this.failFinalizeJob(jobId, job, checkpoint, e);
           return { status: "FAILED", done: false };
         }
 
@@ -865,42 +855,30 @@ export class JobManagerDO {
       event: "chunk.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
 
-    const cleanupAtMs = nowMs() + CLEANUP_TTL_MS;
-    this.upsertJob({
-      ...dbJob,
-      status: "FAILED",
-      updatedAtMs: nowMs(),
-      errorMessage: rawErrText,
-      consecutiveFailures,
-      lastFailureAtMs: nowMs(),
-      lastErrorKind: kind,
-      cleanupAtMs,
-      nextActionAtMs: undefined,
-    });
-
-    await this.rescheduleStorageAlarmFromDb();
+    const cp = this.getCheckpoint(jobId) ?? checkpoint;
+    const clock = this.buildZipTransitionClockConfig();
+    const terminal = lookupZipTransition(
+      { job: dbJob, checkpoint: cp } satisfies ZipTickState,
+      dbJob.status,
+      {
+        type: "chunk_terminal_failure",
+        errText: rawErrText,
+        kind,
+        consecutiveFailures,
+      } satisfies ZipTableEvent,
+      clock,
+    );
+    if (terminal.kind !== "effects") {
+      throw new Error(`[zip-v2] unexpected transition for chunk_terminal_failure: ${terminal.kind}`);
+    }
+    await this.executeZipEffects(terminal.effects);
+    const cleanupAtMs = this.getJobRow(jobId)?.cleanupAtMs;
     console.log(`[zip-v2] Cleanup scheduled (failed).`, {
       jobId,
       transferId: dbJob.transferId,
       cleanupAtMs,
       event: "chunk.failure.terminal" satisfies ZipV2LifecycleEvent,
     });
-
-    // Best-effort failure callback
-    const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
-    await webAPIService
-      .updateTransferStatus(dbJob.transferId, {
-        status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
-      })
-      .catch((e) =>
-        console.warn(`[zip-v2] Failed to update transfer status`, {
-          error: e,
-          jobId,
-          transferId: dbJob.transferId,
-          bundleObjectKey: checkpoint.outputKey,
-          manifestKey: checkpoint.manifestKey,
-        }),
-      );
 
     return { status: "FAILED", done: false };
   }
@@ -1120,6 +1098,67 @@ export class JobManagerDO {
     }
   }
 
+  /** Clock + caps for `lookupZipTransition` (one jitter sample per resolve). */
+  private buildZipTransitionClockConfig(): ZipTransitionClockConfig {
+    return {
+      nowMs: nowMs(),
+      maxConsecutiveFailures: toInt(
+        (this.env as any).ZIP_V2_MAX_CONSECUTIVE_FAILURES,
+        DEFAULT_MAX_CONSECUTIVE_FAILURES,
+      ),
+      retryBaseDelaySeconds: toInt(
+        (this.env as any).ZIP_V2_RETRY_BASE_DELAY_SECONDS,
+        DEFAULT_RETRY_BASE_DELAY_SECONDS,
+      ),
+      tickIntervalMs: toInt((this.env as any).ZIP_V2_TICK_INTERVAL_MS, DEFAULT_TICK_INTERVAL_MS),
+      cleanupTtlMs: CLEANUP_TTL_MS,
+      jitterMsSample: jitterMs(1000),
+    };
+  }
+
+  /**
+   * Runs `ZipEffect`s in stable order: parts → checkpoint → job → alarm → web API.
+   * See `ZIP_EFFECT_EXECUTION_ORDER_DOC` in `zip-v2-transitions.ts`.
+   */
+  private async executeZipEffects(effects: ZipEffect[]) {
+    const inserts = effects.filter((e): e is Extract<ZipEffect, { type: "insert_uploaded_parts" }> => e.type === "insert_uploaded_parts");
+    const checkpoints = effects.filter((e): e is Extract<ZipEffect, { type: "persist_checkpoint" }> => e.type === "persist_checkpoint");
+    const jobs = effects.filter((e): e is Extract<ZipEffect, { type: "persist_job" }> => e.type === "persist_job");
+    const reschedule = effects.some((e) => e.type === "reschedule_storage_alarm");
+    const notifies = effects.filter(
+      (e): e is Extract<ZipEffect, { type: "notify_transfer_compression_failed" }> =>
+        e.type === "notify_transfer_compression_failed",
+    );
+
+    for (const e of inserts) {
+      this.insertUploadedParts(e.jobId, e.parts);
+    }
+    for (const e of checkpoints) {
+      this.upsertCheckpoint(e.jobId, e.checkpoint);
+    }
+    for (const e of jobs) {
+      this.upsertJob(e.job);
+    }
+    if (reschedule) {
+      await this.rescheduleStorageAlarmFromDb();
+    }
+    for (const n of notifies) {
+      const webAPIService = new WebAPIService(this.env.SECRET_KEY, this.env.WEB_API_BASE_URL);
+      await webAPIService
+        .updateTransferStatus(n.transferId, {
+          status: TransferStatus.READY_BUT_COMPRESSION_FAILED,
+        })
+        .catch((e) =>
+          console.warn(`[zip-v2] Failed to update transfer status`, {
+            error: e,
+            transferId: n.transferId,
+            bundleObjectKey: n.outputKey,
+            manifestKey: n.manifestKey,
+          }),
+        );
+    }
+  }
+
   /**
    * Single retry/backoff path for transient errors while `RUNNING` or `FINALIZING`.
    * @returns `ok: false` when max consecutive failures exceeded — caller must terminal-fail the job.
@@ -1133,47 +1172,35 @@ export class JobManagerDO {
   }): Promise<{ ok: true; retryAfterSeconds: number } | { ok: false }> {
     const { jobId, holdStatus, errText, kind, event } = params;
     const dbJob = this.getJobRow(jobId);
-    if (!dbJob) {
+    const checkpoint = this.getCheckpoint(jobId);
+    if (!dbJob || !checkpoint) {
       return { ok: false };
     }
-    const consecutiveFailures = (dbJob.consecutiveFailures ?? 0) + 1;
-    const maxConsecutiveFailures = toInt(
-      (this.env as any).ZIP_V2_MAX_CONSECUTIVE_FAILURES,
-      DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    const clock = this.buildZipTransitionClockConfig();
+    const resolved = lookupZipTransition(
+      { job: dbJob, checkpoint } satisfies ZipTickState,
+      dbJob.status,
+      { type: "retryable_backoff", holdStatus, errText, kind } satisfies ZipTableEvent,
+      clock,
     );
-    const baseDelaySeconds = toInt(
-      (this.env as any).ZIP_V2_RETRY_BASE_DELAY_SECONDS,
-      DEFAULT_RETRY_BASE_DELAY_SECONDS,
-    );
-    if (consecutiveFailures >= maxConsecutiveFailures) {
+    if (resolved.kind === "retry_exhausted") {
       return { ok: false };
     }
-    const backoffSeconds = computeBackoffSeconds(consecutiveFailures, baseDelaySeconds);
-    const backoffUntilMs = nowMs() + backoffSeconds * 1000 + jitterMs(1000);
-    const intervalMs = toInt((this.env as any).ZIP_V2_TICK_INTERVAL_MS, DEFAULT_TICK_INTERVAL_MS);
-    const nextActionAtMs = Math.max(nowMs() + intervalMs, backoffUntilMs);
-    this.upsertJob({
-      ...dbJob,
-      status: holdStatus,
-      updatedAtMs: nowMs(),
-      errorMessage: errText,
-      consecutiveFailures,
-      lastFailureAtMs: nowMs(),
-      lastErrorKind: kind,
-      nextActionAtMs,
-    });
-
-    await this.rescheduleStorageAlarmFromDb();
+    await this.executeZipEffects(resolved.effects);
+    const nextJob = this.getJobRow(jobId) ?? dbJob;
+    const maxConsecutiveFailures = clock.maxConsecutiveFailures;
+    const consecutiveFailures = nextJob.consecutiveFailures ?? 0;
+    const backoffSeconds = resolved.tickResponse?.retryAfterSeconds ?? 0;
     console.warn(`[zip-v2] Retry backoff scheduled.`, {
       jobId,
-      transferId: dbJob.transferId,
+      transferId: nextJob.transferId,
       event,
       status: holdStatus,
       consecutiveFailures,
       maxConsecutiveFailures,
       retryAfterSeconds: backoffSeconds,
       errorKind: kind,
-      nextActionAtMs,
+      nextActionAtMs: nextJob.nextActionAtMs,
     });
     return { ok: true, retryAfterSeconds: backoffSeconds };
   }
@@ -1182,19 +1209,29 @@ export class JobManagerDO {
    * Schedules the next chunk tick after successful progress: `nextActionAtMs = now + tick interval`.
    */
   private async scheduleNextProgressAction(jobId: string) {
-    const intervalMs = toInt((this.env as any).ZIP_V2_TICK_INTERVAL_MS, DEFAULT_TICK_INTERVAL_MS);
-    const nextActionAtMs = nowMs() + Math.max(0, intervalMs);
     const fresh = this.getJobRow(jobId);
-    if (!fresh) {
+    const checkpoint = this.getCheckpoint(jobId);
+    if (!fresh || !checkpoint) {
       console.warn(`[zip-v2] scheduleNextProgressAction: job row missing`, { jobId });
       return;
     }
-    this.upsertJob({ ...fresh, updatedAtMs: nowMs(), nextActionAtMs });
-    await this.rescheduleStorageAlarmFromDb();
+    const clock = this.buildZipTransitionClockConfig();
+    const resolved = lookupZipTransition(
+      { job: fresh, checkpoint } satisfies ZipTickState,
+      fresh.status,
+      { type: "schedule_next_tick_interval" } satisfies ZipTableEvent,
+      clock,
+    );
+    if (resolved.kind !== "effects") {
+      console.warn(`[zip-v2] scheduleNextProgressAction: unexpected result`, { jobId, kind: resolved.kind });
+      return;
+    }
+    await this.executeZipEffects(resolved.effects);
+    const persisted = this.getJobRow(jobId);
     console.log(`[zip-v2] Next progress action scheduled.`, {
       jobId,
       transferId: fresh.transferId,
-      nextActionAtMs,
+      nextActionAtMs: persisted?.nextActionAtMs,
       event: "chunk.succeeded" satisfies ZipV2LifecycleEvent,
     });
   }
